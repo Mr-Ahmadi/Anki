@@ -1,0 +1,126 @@
+# Xcode
+#
+# gitignore contributors: remember to update Global/Xcode.gitignore, Objective-C.gitignore & Swift.gitignore
+
+## User settings
+xcuserdata/
+*.xcuserstate
+*.moved-aside
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+
+## Generated files
+# XcodeGen - uncomment if you want to ignore generated project and regenerate via `xcodegen generate`
+# AnkiClone/AnkiClone.xcodeproj/
+# project.xcworkspace/
+DerivedData/
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+## Build
+build/
+Build/
+*.o
+*.lo
+*.slo
+*.la
+*.a
+*.so
+
+## CocoaPods
+Pods/
+*.xcworkspace
+!AnkiClone/AnkiClone.xcodeproj/project.xcworkspace
+!AnkiClone/AnkiClone.xcodeproj/project.xcworkspace/contents.xcworkspacedata
+!AnkiClone/AnkiClone.xcodeproj/project.xcworkspace/xcshareddata/
+
+## Carthage
+Carthage/Build/
+
+## fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+fastlane/test_output
+
+## Swift Package Manager
+.swiftpm/
+Package.resolved
+# Keep shared Package.resolved for reproducible builds (Xcode 11+)
+!AnkiClone/AnkiClone.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+## Xcode 8 and earlier
+*.xccheckout
+*.xcscmblueprint
+
+# Archives
+*.xcarchive
+
+# AppCode
+.idea/
+
+# Swift
+*.swp
+*~.nib
+local.xcconfig
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Coverage
+*.gcda
+*.gcno
+*.gcov
+coverage/
+*.lcov
+
+# Misc
+*.orig
+*.rej
+*~
+
+# Anki media cache (local device copies, not needed in repo)
+AnkiMedia/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Samples - ignore local Anki sample decks (large binary .apkg files)
+samples/
+**/samples/
+*.apkg
+**/*.apkg
