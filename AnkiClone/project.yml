@@ -22,6 +22,10 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - AnkiClone
+      # Ships the two decks in /samples so "try a sample" works on device.
+      - path: ../samples
+        type: folder
+        buildPhase: resources
     settings:
       base:
         INFOPLIST_FILE: AnkiClone/Info.plist
@@ -36,6 +40,15 @@ targets:
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
     dependencies:
       - package: ZIPFoundation
+
+  AnkiCloneUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - AnkiCloneUITests
+    dependencies:
+      - target: AnkiClone
 
   AnkiCloneTests:
     type: bundle.unit-test
@@ -62,3 +75,4 @@ schemes:
       config: Debug
       targets:
         - AnkiCloneTests
+        - AnkiCloneUITests

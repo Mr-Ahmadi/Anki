@@ -41,60 +41,65 @@ final class TemplateRenderer {
         let nsResult = result as NSString
         let matches = regex.matches(in: result, range: NSRange(location: 0, length: nsResult.length)).reversed()
 
+        let isQuestion = frontSide == nil
         for match in matches {
             let fullRange = match.range(at: 0)
             let innerRange = match.range(at: 1)
             let inner = nsResult.substring(with: innerRange).trimmingCharacters(in: .whitespaces)
 
-            // Skip conditionals already handled, and FrontSide
             if inner.hasPrefix("#") || inner.hasPrefix("/") || inner.hasPrefix("^") { continue }
             if inner == "FrontSide" { continue }
-            if inner.hasPrefix("c") && inner.dropFirst().first?.isNumber == true && inner.contains("::") { continue } // cloze already handled
+            if inner.hasPrefix("c") && inner.dropFirst().first?.isNumber == true && inner.contains("::") { continue }
 
-            let replacement = resolveField(expression: inner, fields: fields)
+            let replacement = resolveField(expression: inner, fields: fields, isQuestion: isQuestion)
             let replacementNS = replacement as NSString
-            // Replace in mutable string
             if let range = Range(fullRange, in: result) {
                 result.replaceSubrange(range, with: replacementNS as String)
             }
         }
 
-        // Inject CSS wrapper if noteType provided
+        // Second pass: cloze inside field values (e.g., Text contains {{c1::...}} and template used {{cloze:Text}})
+        // If cloze markers remain (from field injection), render them now.
+        if result.contains("{{c") {
+            result = renderCloze(result, isQuestion: isQuestion)
+        }
+
         if let noteType, !noteType.css.isEmpty {
             result = wrapWithCSS(result, css: noteType.css)
         }
 
-        // Fix media references: if mediaFolder provided, verify files exist but keep html as is
-        // Anki uses <img src="filename">, [sound:filename], we convert sound to audio
         result = convertSoundTags(result)
-        result = result.replacingOccurrences(of: "type=\"audio/mpeg\"", with: "controls")
+        result = tameEmbeddedMedia(result)
 
         return result
     }
 
     // MARK: - Field resolution
 
-    private static func resolveField(expression: String, fields: [String: String]) -> String {
-        // Handle filters: text:, furigana:, etc.
-        // Format: filter:FieldName or filter1:filter2:FieldName
+    private static func resolveField(expression: String, fields: [String: String], isQuestion: Bool = true) -> String {
+        // Handle filters: text:, cloze:, etc.
         let parts = expression.components(separatedBy: ":")
         guard let fieldName = parts.last?.trimmingCharacters(in: .whitespaces) else { return "" }
 
-        // Try exact match first, then case-insensitive
+        // Support cloze as part of expression like "cloze:Text" where mid is filter
+        // If fieldName looks like "Text" but filter contains cloze, handle it.
         var value = fields[fieldName] ?? fields.first(where: { $0.key.lowercased() == fieldName.lowercased() })?.value ?? ""
         if value.isEmpty { return "" }
 
-        // Apply filters in order (excluding last which is field name)
         for filter in parts.dropLast() {
             let f = filter.trimmingCharacters(in: .whitespaces).lowercased()
             switch f {
             case "text":
                 value = stripHTML(value)
             case "type":
-                // type: field shows input box; for preview just show field
                 break
             case "hint":
                 value = "<a class=\"hint\" href=\"#\" onclick=\"this.style.display='none';this.nextElementSibling.style.display='block';return false;\">[hint]</a><span style=\"display:none\">\(value)</span>"
+            case "cloze":
+                value = renderCloze(value, isQuestion: isQuestion)
+            case "furigana", "kana", "kanji":
+                // Remove ruby/furigana markup for clean display
+                value = value.replacingOccurrences(of: " \\[.*?\\]", with: "", options: .regularExpression)
             default:
                 break
             }
@@ -220,6 +225,30 @@ final class TemplateRenderer {
                 }
             }
         }
+        return result
+    }
+
+    /// Anki decks in the wild embed `<audio autoplay>` pointing at a dictionary
+    /// site — sometimes several per card. Left alone they fire on every card,
+    /// overlap each other, and (over plain http) are blocked outright. Strip the
+    /// autoplay, give them controls, and upgrade the scheme so a tap can work.
+    private static func tameEmbeddedMedia(_ html: String) -> String {
+        var result = html
+        result = result.replacingOccurrences(
+            of: #"\s+autoplay(\s*=\s*("[^"]*"|'[^']*'|[^\s>]+))?"#,
+            with: "",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        result = result.replacingOccurrences(
+            of: #"(<audio\b)(?![^>]*\bcontrols\b)"#,
+            with: "$1 controls preload=\"none\"",
+            options: [.regularExpression, .caseInsensitive]
+        )
+        result = result.replacingOccurrences(
+            of: #"(src\s*=\s*["\']?)http://"#,
+            with: "$1https://",
+            options: [.regularExpression, .caseInsensitive]
+        )
         return result
     }
 

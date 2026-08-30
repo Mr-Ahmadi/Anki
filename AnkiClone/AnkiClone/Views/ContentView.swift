@@ -3,8 +3,14 @@ import SwiftData
 
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
+    @Query private var decks: [Deck]
+    @Query private var cards: [Card]
     @State private var selectedTab = 0
     @State private var showImport = false
+
+    private var totalDue: Int {
+        cards.filter { $0.queue == 2 && $0.dueDate <= Date() }.count
+    }
 
     var body: some View {
         TabView(selection: $selectedTab) {
@@ -13,6 +19,7 @@ struct ContentView: View {
                     Label("Decks", systemImage: selectedTab == 0 ? "rectangle.stack.fill" : "rectangle.stack")
                 }
                 .tag(0)
+                .badge(totalDue > 0 ? totalDue : 0)
 
             BrowseView()
                 .tabItem {
@@ -33,13 +40,19 @@ struct ContentView: View {
                 .tag(3)
         }
         .tint(.indigo)
-        .sheet(isPresented: $showImport) {
-            ImportView()
+        // Modern tab bar appearance (iOS 17 translucency)
+        .onAppear {
+            let tabBar = UITabBar.appearance()
+            tabBar.isTranslucent = true
         }
+        .sheet(isPresented: $showImport) { ImportView() }
         .onOpenURL { url in
             if url.pathExtension.lowercased() == "apkg" || url.pathExtension.lowercased() == "colpkg" {
                 showImport = true
-                NotificationCenter.default.post(name: .didReceiveApkgURL, object: url)
+                // Delay posting to ensure sheet is presented
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    NotificationCenter.default.post(name: .didReceiveApkgURL, object: url)
+                }
             }
         }
     }
@@ -51,5 +64,5 @@ extension Notification.Name {
 
 #Preview {
     ContentView()
-        .modelContainer(for: [Deck.self, Note.self, Card.self, NoteType.self], inMemory: true)
+        .modelContainer(for: [Deck.self, Note.self, Card.self, NoteType.self, ReviewLog.self], inMemory: true)
 }

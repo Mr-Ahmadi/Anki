@@ -1,124 +1,215 @@
 import SwiftUI
 import WebKit
-import AVFoundation
+
+// MARK: - CardWebView
+// Renders a card's Anki HTML with its own CSS and media.
+//
+// Two things every deck in the wild needs and plain WKWebView doesn't give you:
+//
+//  * **Self-sizing.** A card is one item in a scrolling column, so the web view
+//    must be exactly as tall as its content — a fixed frame either clips long
+//    answers or leaves a hole under short ones.
+//  * **Readable in dark mode.** Shared decks hardcode `color: black` inline
+//    (the TOEFL sample does it on every field). On a dark background that is
+//    invisible. After load we lighten only the colours that are too dark to
+//    read, keeping their hue so the deck's own colour-coding survives.
 
 struct CardWebView: UIViewRepresentable {
     let html: String
-    let baseURL: URL?
+    var baseURL: URL?
+    /// Reports the rendered content height so the container can size itself.
     var onHeightChange: ((CGFloat) -> Void)?
 
     func makeUIView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        config.defaultWebpagePreferences.allowsContentJavaScript = true
-        config.allowsInlineMediaPlayback = true
-        config.mediaTypesRequiringUserActionForPlayback = []
+        let configuration = WKWebViewConfiguration()
+        configuration.defaultWebpagePreferences.allowsContentJavaScript = true
+        configuration.allowsInlineMediaPlayback = true
+        configuration.allowsPictureInPictureMediaPlayback = false
+        configuration.mediaTypesRequiringUserActionForPlayback = .all
+        configuration.userContentController.add(context.coordinator, name: Coordinator.heightMessage)
+        configuration.userContentController.addUserScript(
+            WKUserScript(source: Self.instrumentation, injectionTime: .atDocumentEnd, forMainFrameOnly: true)
+        )
 
-        let webView = WKWebView(frame: .zero, configuration: config)
+        let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.isOpaque = false
         webView.backgroundColor = .clear
+        webView.scrollView.backgroundColor = .clear
         webView.scrollView.isScrollEnabled = false
         webView.scrollView.bounces = false
-        webView.scrollView.showsVerticalScrollIndicator = false
+        webView.scrollView.contentInsetAdjustmentBehavior = .never
         webView.navigationDelegate = context.coordinator
         webView.allowsBackForwardNavigationGestures = false
-        // Observe content size if needed
+        webView.allowsLinkPreview = false
+        webView.setContentHuggingPriority(.required, for: .vertical)
         return webView
     }
 
     func updateUIView(_ webView: WKWebView, context: Context) {
-        // Avoid reloading if same html
-        if context.coordinator.lastHTML == html { return }
-        context.coordinator.lastHTML = html
+        context.coordinator.onHeightChange = onHeightChange
+        guard context.coordinator.loadedHTML != html else { return }
+        context.coordinator.loadedHTML = html
+        let document = html.lowercased().contains("<html") ? html : Self.wrap(html)
+        webView.loadHTMLString(document, baseURL: baseURL ?? SpeechService.mediaDirectory)
+    }
 
-        let header = """
-        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-        """
-        let fullHTML: String
-        if html.lowercased().contains("<html") {
-            fullHTML = html
-        } else {
-            fullHTML = """
-            <html><head>\(header)<style>
-            :root { color-scheme: light dark; }
-            body {
-                font-family: -apple-system, 'Helvetica Neue', sans-serif;
-                font-size: 20px;
-                line-height: 1.5;
-                text-align: center;
-                color: #1a1a1a;
-                background: transparent;
-                padding: 16px 12px;
-                margin: 0;
-                word-wrap: break-word;
-                -webkit-text-size-adjust: 100%;
-            }
-            @media (prefers-color-scheme: dark) {
-                body { color: #e8e8e8; }
-                a { color: #5B8DEF; }
-                hr#answer { border-color: #333 !important; }
-            }
-            img { max-width: 100%; height: auto; border-radius: 12px; margin: 8px 0; }
-            a { color: #2962FF; text-decoration: none; font-weight: 600; }
-            .cloze { color: #2962FF; font-weight: 800; background: rgba(41,98,255,0.08); padding: 1px 6px; border-radius: 6px; }
-            .cloze b, .cloze i { color: #2962FF; }
-            hr#answer, hr { border: none; border-top: 1.5px solid #e8e8e8; margin: 18px 0; }
-            audio {
-                width: 100%; margin: 12px 0; border-radius: 10px;
-                background: #f2f2f7;
-            }
-            @media (prefers-color-scheme: dark) { audio { background: #2c2c2e; } }
-            .card { max-width: 100%; }
-            b, strong { font-weight: 700; }
-            </style></head><body class="card">\(html)</body></html>
-            """
+    static func dismantleUIView(_ webView: WKWebView, coordinator: Coordinator) {
+        webView.configuration.userContentController.removeScriptMessageHandler(forName: Coordinator.heightMessage)
+        webView.stopLoading()
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(onHeightChange: onHeightChange) }
+
+    // MARK: - Coordinator
+
+    final class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
+        static let heightMessage = "cardHeight"
+
+        var loadedHTML: String?
+        var onHeightChange: ((CGFloat) -> Void)?
+        private var lastReportedHeight: CGFloat = 0
+
+        init(onHeightChange: ((CGFloat) -> Void)?) {
+            self.onHeightChange = onHeightChange
         }
-        webView.loadHTMLString(fullHTML, baseURL: baseURL ?? mediaBaseURL())
-    }
 
-    func makeCoordinator() -> Coordinator { Coordinator() }
+        func userContentController(_ controller: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard message.name == Self.heightMessage, let value = message.body as? NSNumber else { return }
+            let height = CGFloat(value.doubleValue)
+            // Ignore sub-point jitter from font loading.
+            guard height > 0, abs(height - lastReportedHeight) > 1 else { return }
+            lastReportedHeight = height
+            onHeightChange?(height)
+        }
 
-    private func mediaBaseURL() -> URL? {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("AnkiMedia", isDirectory: true)
-    }
-
-    class Coordinator: NSObject, WKNavigationDelegate {
-        var lastHTML: String?
-
-        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-            if let url = navigationAction.request.url {
-                // Intercept audio/image local files - allow
-                if url.isFileURL { decisionHandler(.allow); return }
-                // Allow media baseURL resources
-                if url.scheme == "about" || url.scheme == "data" { decisionHandler(.allow); return }
-                // For http/https links, open externally if it's a navigation (not resource load)
-                if (url.scheme == "http" || url.scheme == "https") && navigationAction.navigationType == .linkActivated {
-                    UIApplication.shared.open(url)
-                    decisionHandler(.cancel)
-                    return
-                }
+        func webView(
+            _ webView: WKWebView,
+            decidePolicyFor navigationAction: WKNavigationAction,
+            decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
+        ) {
+            guard let url = navigationAction.request.url else { return decisionHandler(.allow) }
+            if navigationAction.navigationType == .linkActivated,
+               url.scheme == "http" || url.scheme == "https" {
+                UIApplication.shared.open(url)
+                return decisionHandler(.cancel)
             }
             decisionHandler(.allow)
         }
+    }
 
-        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-            // Enable audio controls fix for Anki sound tags already converted to <audio>
-            // No extra JS needed - WKWebView handles audio playback inline
+    // MARK: - Page scaffolding
+
+    /// Injected after the document loads: reports height and repairs unreadable colours.
+    private static let instrumentation = """
+    (function () {
+      function report() {
+        var body = document.body;
+        if (!body) { return; }
+        var height = Math.max(
+          body.scrollHeight, body.offsetHeight,
+          document.documentElement.scrollHeight, document.documentElement.offsetHeight
+        );
+        window.webkit.messageHandlers.cardHeight.postMessage(height);
+      }
+
+      // Shared decks hardcode dark text inline. Lift only what is too dark to
+      // read on a dark background, preserving hue so colour coding survives.
+      function repairContrast() {
+        if (!window.matchMedia('(prefers-color-scheme: dark)').matches) { return; }
+        var nodes = document.querySelectorAll('*');
+        for (var i = 0; i < nodes.length; i++) {
+          var node = nodes[i];
+          var parsed = /rgba?\\(([^)]+)\\)/.exec(window.getComputedStyle(node).color);
+          if (!parsed) { continue; }
+          var parts = parsed[1].split(',').map(parseFloat);
+          var r = parts[0] / 255, g = parts[1] / 255, b = parts[2] / 255;
+          var max = Math.max(r, g, b), min = Math.min(r, g, b);
+          var lightness = (max + min) / 2;
+          if (lightness > 0.45) { continue; }
+          if (max - min < 0.08) {
+            node.style.color = '#F2F2F7';
+          } else {
+            var hue, delta = max - min;
+            if (max === r) { hue = ((g - b) / delta) % 6; }
+            else if (max === g) { hue = (b - r) / delta + 2; }
+            else { hue = (r - g) / delta + 4; }
+            hue = Math.round(hue * 60);
+            if (hue < 0) { hue += 360; }
+            var saturation = Math.round((delta / (1 - Math.abs(2 * lightness - 1))) * 100);
+            node.style.color = 'hsl(' + hue + ',' + Math.min(saturation, 90) + '%,72%)';
+          }
         }
+      }
+
+      repairContrast();
+      report();
+      if (window.ResizeObserver) { new ResizeObserver(report).observe(document.body); }
+      window.addEventListener('load', function () { repairContrast(); report(); });
+      document.querySelectorAll('img').forEach(function (img) {
+        img.addEventListener('load', report);
+        img.addEventListener('error', report);
+      });
+      setTimeout(report, 120);
+      setTimeout(report, 500);
+    })();
+    """
+
+    static func wrap(_ body: String) -> String {
+        """
+        <!DOCTYPE html><html><head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+        <style>
+        :root { color-scheme: light dark; --ink: #10131A; --muted: #6B7280; --accent: #4C5BD4; --rule: #E6E8EE; }
+        @media (prefers-color-scheme: dark) {
+          :root { --ink: #F2F2F7; --muted: #9BA1AC; --accent: #93A6FF; --rule: #33363D; }
+        }
+        * { box-sizing: border-box; }
+        html { -webkit-text-size-adjust: 100%; }
+        body {
+          font: 400 20px/1.55 -apple-system, system-ui, "SF Pro Text", "Helvetica Neue", sans-serif;
+          color: var(--ink);
+          background: transparent;
+          margin: 0;
+          padding: 16px 18px;
+          text-align: center;
+          overflow-wrap: break-word;
+          -webkit-font-smoothing: antialiased;
+        }
+        .card { max-width: 680px; margin: 0 auto; background: transparent; }
+        a { color: var(--accent); text-decoration: none; font-weight: 500; }
+        img { max-width: 100%; height: auto; border-radius: 12px; margin: 10px 0; }
+        hr, hr#answer { border: none; border-top: 1px solid var(--rule); margin: 18px 0; }
+        audio { width: 100%; max-width: 320px; height: 36px; margin: 8px 0; }
+        ul, ol { text-align: left; padding-left: 1.2em; margin: 10px 0; }
+        li { margin: 4px 0; }
+        sub, sup { font-size: 0.7em; }
+        .cloze { color: var(--accent); font-weight: 700; }
+        .hint { color: var(--muted); font-style: italic; }
+        </style>
+        </head><body class="card">\(body)</body></html>
+        """
     }
 }
 
-// Simpler previewable view
+// MARK: - SizedCardWebView
 
-struct CardContentView: View {
+/// `CardWebView` that grows to fit its content, with a floor so an empty or
+/// still-loading card doesn't collapse.
+struct SizedCardWebView: View {
     let html: String
-    var baseURL: URL? {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("AnkiMedia", isDirectory: true)
-    }
+    var baseURL: URL?
+    var minHeight: CGFloat = 90
+    var maxHeight: CGFloat = 2600
+
+    @State private var height: CGFloat = 0
 
     var body: some View {
-        CardWebView(html: html, baseURL: baseURL)
-            .frame(minHeight: 220)
+        CardWebView(html: html, baseURL: baseURL) { measured in
+            let clamped = min(max(measured, minHeight), maxHeight)
+            guard abs(clamped - height) > 1 else { return }
+            height = clamped
+        }
+        .frame(height: max(height, minHeight))
+        .animation(.easeOut(duration: 0.18), value: height)
     }
 }

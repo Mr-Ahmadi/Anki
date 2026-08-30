@@ -1,119 +1,139 @@
-# AnkiClone — iOS Replacement for Anki
+# AnkiClone
 
-A native iOS app that is **fully compatible with Anki `.apkg` / `.colpkg` files**. Import decks from Anki Desktop, AnkiWeb, or shared decks and study them with an Anki-accurate scheduler, HTML template rendering, and media support.
+An iOS app for studying Anki decks, built for **learning how words are pronounced**.
 
-Built with **SwiftUI + SwiftData + SQLite** — no server required, 100% on-device.
+Import an `.apkg` or `.colpkg` file from Anki Desktop or AnkiWeb and study it on-device — no
+account, no server, no network. SwiftUI + SwiftData + SQLite.
 
-## Screenshots (Simulator)
+## The idea
 
-- **Decks** — hierarchical deck list with new/learn/due pills, swipe actions, empty state
-- **Study** — card flip, Again/Hard/Good/Easy with interval previews, learning re-queue, bury/suspend
-- **Browse** — search cards/notes/tags, filter by deck/status, card detail with rendered previews
-- **Stats** — totals, deck breakdown, 7-day forecast, review history (Swift Charts)
-- **Import** — file picker, share-sheet, sample decks, progress
+Most vocabulary decks put a word, its meaning and its example sentences into one field, or into
+several fields with no shared structure. Read aloud, that comes out as a single breathless blob:
 
-## Features
+> "ACCELERATE VERB Speed up expedite hasten quicken measures to accelerate the rate of economic
+> growth The car accelerated smoothly away شتاب گرفتن"
+
+AnkiClone parses a note into its parts first, then presents and speaks each part on its own:
+
+| Part | Shown as | Spoken |
+| ---- | -------- | ------ |
+| Headword | Large, on its own | **Hear the word** — slower rate, its own voice |
+| Phonetic respelling / IPA | Under the word | Never (it isn't a word) |
+| Part of speech | A chip | Never |
+| Meaning | A numbered "Meaning" section | With the answer |
+| Examples | One row each | **Play all**, or tap any single sentence |
+| Translation | Its own section, laid out RTL where appropriate | In *that* language's voice |
+| Synonyms / opposites | Chips | Tap one to hear it |
+
+Where a deck ships its own recording (`[sound:aberrant.mp3]`), that recording is played instead of
+the synthesised voice.
+
+## How the parsing works
+
+`Services/CardContent.swift` classifies each field by name (`Word`, `Phonetic Spelling`, `Examples`,
+`Persian`, …), then falls back to reading the markup for decks that only have `Front` / `Back`:
+
+- list items and italics mark example sentences — the two conventions shared decks actually use;
+- a bullet (`•`, `·`, or the `U+F0B7` Symbol-font bullet that Word exports leave behind) separates
+  a gloss from the examples glued after it;
+- `≠` marks an antonym; `:`-separated short phrases are a gloss list, not a sentence;
+- an unmarked *first* chunk is always the definition, even when it repeats the headword.
+
+Language is decided by script where the script is decisive (Japanese, Korean, Cyrillic, Greek,
+Hebrew, Thai), and by field name where it isn't — a field called "Persian" settles a question the
+Arabic alphabet cannot. Short Latin-script text is never guessed at; it falls back to the card
+language set in Settings.
+
+`Services/HTMLText.swift` is the scanner underneath: it splits field HTML into blocks at block-level
+boundaries while keeping inline runs together, so a sentence broken up by `<a>` links survives as
+one sentence rather than five fragments.
+
+## Everything else
 
 | Area | Detail |
-|------|--------|
-| **Import** | `ApkgImporter.swift:36` — ZIPFoundation unzip, SQLite3 read of `collection.anki21`/`collection.anki2`, `media` JSON mapping, copy to `ApplicationSupport/AnkiMedia` |
-| **Models** | `AnkiModels.swift:8` — `Deck`, `NoteType`, `Note`, `Card`, `ReviewLog` via SwiftData |
-| **Scheduler** | `Scheduler.swift:22` — SM-2 variant matching Anki v2: new/learn/review/relearn handling, ease factors, lapse multipliers, interval formatting |
-| **Templates** | `TemplateRenderer.swift:7` — `{{Field}}`, `{{FrontSide}}`, `{{#Field}}...{{/Field}}`, `{{^Field}}`, `{{text:Field}}`, `{{c1::cloze}}`, `[sound:]` → `<audio>`, CSS wrapping |
-| **Rendering** | `WebView.swift:5` — `WKWebView` with `baseURL = AnkiMedia`, viewport meta, cloze & audio fixes |
-| **Media** | Images `<img>`, audio `[sound:]` and `<audio autoplay>`, filename sanitization, bundled via `baseURL` |
-| **Subdecks** | `::` hierarchy split into `displayName` / `parentPath` |
-| **Persistence** | SwiftData, `AnkiCloneApp.swift:7` container, relationships `Deck ↔ Card ↔ Note` |
+| ---- | ------ |
+| **Import** | `ApkgImporter.swift` — ZIPFoundation unzip, SQLite read of `collection.anki21`/`.anki2`, media copied to `ApplicationSupport/AnkiMedia` |
+| **Scheduler** | `Scheduler.swift` — SM-2 as used by Anki v2: learning steps, lapses, ease factors, interval previews on every rating button |
+| **Study** | Daily new/review limits, learn-ahead window, one-tap undo, suspend and bury, pinned rating buttons |
+| **Templates** | `{{Field}}`, `{{FrontSide}}`, `{{#Field}}`/`{{^Field}}`, `{{text:}}`, `{{hint:}}`, `{{cloze:}}`, `[sound:]`; remote `<audio autoplay>` is defused so shared decks don't fire five players per card |
+| **Rendering** | `WebView.swift` — self-sizing `WKWebView`; in dark mode, text that a deck hardcoded to black is lightened while keeping its hue |
+| **Browse** | Search by field, tag or deck; filter by state; a card detail view with the parsed content and the rendered template side by side |
+| **Stats** | Totals, per-deck breakdown, forecast, review history (Swift Charts) |
 
-## Anki Compatibility
+Cards the parser can't read as vocabulary — cloze deletions, image occlusion, anything with
+`<img>` — fall through to the deck's own HTML template, unchanged. "Clean card layout" in Settings
+turns the parsed view off entirely if you'd rather always see the deck as its author designed it.
 
-- Tested with exports from **Anki 2.1.66+** (`schedVer: 2`, `crt`, `dconf`, `models`, `decks`, `notes`, `cards`, `revlog`)
-- Sample files: `samples/1212 Words.apkg` (1209 cards), `samples/540_MUST_KNOW_WORDS_FOR_TOEFL_IBT.apkg` — verified `collection.anki21` schema
-- Preserves `due`, `ivl`, `factor`, `reps`, `lapses`, `dueDate` conversion (days since `crt` vs timestamp)
-- Supports `.apkg` (single deck) and `.colpkg` (full collection) — same ZIP/SQLite layout
-- Does **not** yet sync with AnkiWeb — manual file import only. FSRS parameters are mapped to SM-2 defaults; custom `dconf` per-deck config planned.
+## The icon
 
-## Project Structure
+`Tools/make-icon.swift` draws it — a flashcard with a sound wave coming off it — straight into a
+1024×1024 PNG with Core Graphics, so it can be regenerated or adjusted without a design tool:
 
-```
-AnkiClone/
-  project.yml              — XcodeGen spec (iOS 17, ZIPFoundation)
-  AnkiClone/
-    AnkiCloneApp.swift
-    Info.plist             — UTType for .apkg/.colpkg, file association
-    Models/AnkiModels.swift
-    Services/
-      ApkgImporter.swift
-      Scheduler.swift
-      TemplateRenderer.swift
-    Utils/WebView.swift
-    Views/
-      ContentView.swift    — TabView (Decks/Browse/Stats/Settings)
-      DeckListView.swift
-      StudyView.swift
-      BrowseView.swift
-      ImportView.swift     — DocumentPicker + share-sheet + samples
-      StatsView.swift
-      SettingsView.swift
-    Resources/Assets.xcassets
-  AnkiCloneTests/
+```bash
+swift Tools/make-icon.swift AnkiClone/Resources/Assets.xcassets/AppIcon.appiconset/AppIcon.png
 ```
 
-## Build & Run
+## Build & run
 
-**Requirements:** Xcode 15.4+, iOS 17.0+
+Requires Xcode 15.4+ and iOS 17.
 
 ```bash
 cd AnkiClone
-# Generate (already generated; re-run after editing project.yml)
-xcodegen generate
-open AnkiClone.xcodeproj
-# Select iPhone 15 Simulator, Cmd+R
+./generate.sh                 # regenerate the Xcode project from project.yml
+open AnkiClone.xcodeproj      # ⌘R
 ```
 
-CLI:
+`generate.sh` wraps `xcodegen` because XcodeGen 2.45 emits `objectVersion = 77`, which Xcode 15.4
+refuses to open; the script rewrites the header back to 60.
 
 ```bash
-xcodebuild -project AnkiClone.xcodeproj -scheme AnkiClone -destination 'generic/platform=iOS Simulator' build
-xcodebuild test -project AnkiClone.xcodeproj -scheme AnkiClone -destination 'platform=iOS Simulator,name=iPhone 15,OS=17.5'
-# → BUILD SUCCEEDED, 3 tests passed
+xcodebuild build -project AnkiClone.xcodeproj -scheme AnkiClone \
+  -destination 'generic/platform=iOS Simulator'
+
+xcodebuild test -project AnkiClone.xcodeproj -scheme AnkiClone \
+  -destination 'platform=iOS Simulator,name=iPhone 15'
 ```
 
-## Importing Decks
+## Tests
 
-1. **From app:** Decks tab → `Import` → `Choose File` → select `.apkg`
-2. **From Files/Share:** Long-press `.apkg` → Share → AnkiClone
-3. **Simulator samples:** Import view auto-discovers `/samples/*.apkg` when run from repo path (dev only)
+46 unit tests and 3 UI tests, all passing.
 
-Media is extracted to `ApplicationSupport/AnkiMedia` and served to `WKWebView` via `baseURL`.
+The unit tests cover template rendering, the HTML scanner, the content analyzer, language
+detection, the scheduler and due-date conversion. Two of them are **corpus tests**: they import the
+two bundled sample decks for real and run the analyzer over all 1,749 notes, asserting that
 
-## Study Flow
+- every one of the 540 TOEFL notes yields a headword and a definition, and >95% yield examples;
+- no example still carries the bullet that separated it, and no definition has swallowed one;
+- >90% of the 1,209-note deck parses into the clean layout;
+- nothing handed to the speech synthesiser still contains markup or a URL.
 
-`StudyView.swift:12` builds queue as:
+A dedicated suite covers what must never reach the synthesiser: tags, tags that only appear after
+entity decoding (`&lt;div&gt;`, and the double-encoded `&amp;lt;div&amp;gt;` that scraper exports
+produce), unterminated tags, `<script>` and `<style>` bodies, attribute values containing `>`,
+`[sound:]` and cloze scaffolding, URLs, and the private-use glyphs Word-exported decks are full of.
+A real inequality in a card — "5 < 6" — still has to survive, so a `<` only starts a tag when a
+name follows it.
 
-```
-learn (up to 20, sorted by due) → due (up to 200, dueDate ≤ now) → new (20, shuffled)
-```
+The UI tests drive the real app: import a bundled deck, open it, reveal an answer, check that the
+word, the meaning and the examples are separate and separately playable, and answer a card.
 
-- `Again` → 1 min re-learn, re-queued 3 cards ahead (`left` encoding)
-- `Hard/Good/Easy` → scheduler computes `interval`, `easeFactor`, `dueDate` via `Scheduler:58`
-- Intervals shown on buttons via `nextIntervals(for:)` with `m/h/d/mo/y` formatting
+## Importing your own decks
 
-## Known Limitations / Roadmap
+- **In the app:** Decks → `+` → Import deck…
+- **From Files or another app:** share an `.apkg` to AnkiClone
+- **To try it out:** the two decks in `samples/` are bundled with the app and offered on the import
+  screen
 
-- [ ] AnkiWeb sync (requires `sync` protocol)
-- [ ] FSRS v4 exact replication (currently SM-2 with configurable `DeckConfig`)
-- [ ] Image occlusion, LaTeX
-- [ ] Add/edit notes, custom note types
-- [ ] Export `.apkg`
-- [ ] Background fetch for due notifications
+Media is extracted to `ApplicationSupport/AnkiMedia` and served to the web view as its base URL.
+
+## Not implemented
+
+- AnkiWeb sync — import only
+- FSRS (scheduling is SM-2 with Anki's defaults)
+- Creating or editing notes, and exporting `.apkg`
+- Image occlusion and LaTeX
+- Per-deck configuration (`dconf` is read but daily limits are global)
 
 ## License
 
-MIT — Anki® is a trademark of Damien Elmes. Not affiliated.
-
-## How It Was Verified
-
-- `xcodebuild build` → **BUILD SUCCEEDED**
-- `xcodebuild test` → **3 tests passed** (`TemplateRenderer`, `Scheduler`)
-- Manual SQLite inspection of `1212 Words.apkg` (1209 cards/notes) confirmed `decks/models/dconf` parsing
+MIT. Anki® is a trademark of Damien Elmes; this project is not affiliated with or endorsed by Anki.
