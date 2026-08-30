@@ -614,6 +614,66 @@ final class ApkgImportTests: XCTestCase {
         }
     }
 
+    // MARK: Entry path sanitising
+
+    /// Reproduces the device failure. The work directory exists and is reached
+    /// through /private; the file about to be extracted does not exist yet.
+    /// `standardizedFileURL` strips the /private prefix only for the former, so
+    /// a guard that standardises both sides rejects every entry — the app
+    /// extracted nothing and reported the archive as empty. The simulator's
+    /// temp directory has no /private prefix, which is why this only ever
+    /// showed up on a real phone.
+    func testDestinationIsUnaffectedByPrivatePrefixStandardisation() throws {
+        let work = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try XCTSkipUnless(
+            (try? FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)) != nil,
+            "cannot write to /private/tmp here"
+        )
+        defer { try? FileManager.default.removeItem(at: work) }
+
+        let child = work.appendingPathComponent("collection.anki2")
+        // The asymmetry itself — skip rather than fail if the platform ever
+        // stops behaving this way, since the point is the sanitiser's immunity.
+        try XCTSkipUnless(work.standardizedFileURL.path != work.path, "/private not stripped on this platform")
+        XCTAssertFalse(
+            child.standardizedFileURL.path.hasPrefix(work.standardizedFileURL.path),
+            "this is the comparison that used to reject every archive entry"
+        )
+
+        let dest = try XCTUnwrap(ApkgImporter.sanitizedDestination(forEntry: "collection.anki2", in: work))
+        XCTAssertEqual(dest.path, child.path, "the destination must not depend on what exists on disk")
+    }
+
+    func testEntryPathsAreSanitised() throws {
+        let root = URL(fileURLWithPath: "/work", isDirectory: true)
+        func dest(_ entry: String) -> String? { ApkgImporter.sanitizedDestination(forEntry: entry, in: root)?.path }
+
+        XCTAssertEqual(dest("media"), "/work/media")
+        XCTAssertEqual(dest("My Deck/collection.anki2"), "/work/My Deck/collection.anki2")
+        // An absolute entry path is re-rooted inside the work directory.
+        XCTAssertEqual(dest("/etc/passwd"), "/work/etc/passwd")
+        // Anything that could climb out is refused outright.
+        XCTAssertNil(dest("../escape"))
+        XCTAssertNil(dest("a/../../escape"))
+        XCTAssertNil(dest(""))
+        XCTAssertNil(dest("."))
+    }
+
+    /// Packages that keep their files inside a folder must still import; a
+    /// top-level-only scan reports "no collection found" on these.
+    @MainActor
+    func testCollectionNestedInAFolderIsFound() async throws {
+        let collection = workDir.appendingPathComponent("collection.anki2")
+        try makeCollection(noteCount: 6, at: collection)
+        let package = try makePackage(named: "nested.apkg", files: ["My Deck/collection.anki2": collection])
+
+        let context = try freshContext()
+        let result = try await ApkgImporter(modelContext: context).import(from: package)
+        XCTAssertEqual(result.notesImported, 6)
+        XCTAssertEqual(result.cardsImported, 6)
+    }
+
     @MainActor
     func testArchiveWithoutACollectionReportsAnError() async throws {
         let stray = workDir.appendingPathComponent("readme.txt")
@@ -624,8 +684,9 @@ final class ApkgImportTests: XCTestCase {
         do {
             _ = try await ApkgImporter(modelContext: context).import(from: package)
             XCTFail("an archive with no collection must not import silently")
-        } catch ImportError.noCollectionFound {
-            // expected
+        } catch ImportError.noCollectionFound(let contents) {
+            // The message must name what was actually in the archive.
+            XCTAssertTrue(contents.contains("readme.txt"), "got: \(contents)")
         }
     }
 

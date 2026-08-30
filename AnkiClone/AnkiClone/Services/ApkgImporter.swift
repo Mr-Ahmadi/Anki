@@ -8,7 +8,7 @@ enum ImportError: LocalizedError {
     case unzipFailed(String)
     case sqliteOpenFailed
     case sqliteError(String)
-    case noCollectionFound
+    case noCollectionFound(String)
     case unsupportedPackageFormat
     case emptyCollection
     case cancelled
@@ -19,7 +19,10 @@ enum ImportError: LocalizedError {
         case .unzipFailed(let s): return "Failed to unzip: \(s)"
         case .sqliteOpenFailed: return "Failed to open database"
         case .sqliteError(let s): return "Database error: \(s)"
-        case .noCollectionFound: return "No collection found in archive"
+        case .noCollectionFound(let contents):
+            return contents.isEmpty
+                ? "The archive is empty — nothing could be extracted from it."
+                : "No collection found in archive. It contains: \(contents)"
         case .unsupportedPackageFormat:
             return "This package uses Anki's newest (compressed) export format, which this app cannot read yet. In Anki Desktop re-export the deck with “Support older Anki versions” checked."
         case .emptyCollection: return "The archive opened, but contains no notes or cards"
@@ -98,7 +101,9 @@ final class ApkgImporter {
         try Task.checkCancellation()
 
         report("Locating collection…")
-        guard let collectionURL = try findCollection(in: tempDir) else { throw ImportError.noCollectionFound }
+        guard let collectionURL = try findCollection(in: tempDir) else {
+            throw ImportError.noCollectionFound(describeContents(of: tempDir))
+        }
 
         let mediaMap = parseMediaMap(in: tempDir)
         if !mediaMap.isEmpty { report("Copying \(mediaMap.count) media files…") }
@@ -125,14 +130,11 @@ final class ApkgImporter {
             throw ImportError.unzipFailed("Cannot open archive: \(error.localizedDescription)")
         }
 
-        let root = destDir.standardizedFileURL.path
         var extracted = 0
         for entry in archive {
             try Task.checkCancellation()
 
-            let destURL = destDir.appendingPathComponent(entry.path).standardizedFileURL
-            // Prevent directory traversal
-            guard destURL.path.hasPrefix(root) else { continue }
+            guard let destURL = Self.sanitizedDestination(forEntry: entry.path, in: destDir) else { continue }
 
             if entry.type == .directory {
                 try fileManager.createDirectory(at: destURL, withIntermediateDirectories: true)
@@ -145,7 +147,7 @@ final class ApkgImporter {
             }
 
             do {
-                _ = try archive.extract(entry, to: destURL, skipCRC32: true)
+                _ = try archive.extract(entry, to: destURL)
             } catch {
                 throw ImportError.unzipFailed(error.localizedDescription)
             }
@@ -153,6 +155,23 @@ final class ApkgImporter {
             extracted += 1
             if extracted % 200 == 0 { report("Unzipping… \(extracted) files") }
         }
+    }
+
+    /// Resolves an archive entry to a destination inside `destDir`, rejecting
+    /// anything that would escape it.
+    ///
+    /// Deliberately pure string work. `standardizedFileURL` strips the
+    /// `/private` prefix only for paths that already exist, so standardizing
+    /// the work directory and comparing it against a not-yet-extracted file
+    /// rejects every entry on a real device, where tmp really is under
+    /// /private/var — the simulator has no such prefix and never shows it.
+    static func sanitizedDestination(forEntry path: String, in destDir: URL) -> URL? {
+        let components = path.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        // ".." could climb out; an absolute entry path is simply re-rooted.
+        guard !components.contains("..") else { return nil }
+        let meaningful = components.filter { $0 != "." }
+        guard !meaningful.isEmpty else { return nil }
+        return meaningful.reduce(destDir) { $0.appendingPathComponent($1) }
     }
 
     /// Picks the first candidate that really is a SQLite database. Anki 2.1.50+
@@ -167,11 +186,37 @@ final class ApkgImporter {
         if candidates.isEmpty, let files = try? fileManager.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
             candidates = files.filter { $0.lastPathComponent.hasPrefix("collection.anki") }
         }
+        // Some packages keep everything inside a folder, so a top-level scan
+        // finds nothing. Fall back to walking the tree.
+        if candidates.isEmpty, let walker = fileManager.enumerator(at: dir, includingPropertiesForKeys: nil) {
+            candidates = walker.compactMap { $0 as? URL }
+                .filter { $0.lastPathComponent.hasPrefix("collection.anki") }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        }
         guard !candidates.isEmpty else { return nil }
 
         if let usable = candidates.first(where: { isSQLiteDatabase(at: $0) }) { return usable }
         if candidates.contains(where: { isZstdCompressed(at: $0) }) { throw ImportError.unsupportedPackageFormat }
         return nil
+    }
+
+    /// Names (and sizes) of what actually landed in the work directory, so a
+    /// package we cannot read says why instead of just "no collection found".
+    private static func describeContents(of dir: URL) -> String {
+        let fileManager = FileManager.default
+        guard let walker = fileManager.enumerator(at: dir, includingPropertiesForKeys: [.fileSizeKey]) else { return "" }
+        let root = dir.path
+        return walker.compactMap { $0 as? URL }
+            .map { url -> String in
+                let relative = url.path.hasPrefix(root)
+                    ? String(url.path.dropFirst(root.count).drop(while: { $0 == "/" }))
+                    : url.lastPathComponent
+                let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+                return "\(relative) (\(size) bytes)"
+            }
+            .sorted()
+            .prefix(12)
+            .joined(separator: ", ")
     }
 
     private static func header(of url: URL, count: Int) -> [UInt8] {

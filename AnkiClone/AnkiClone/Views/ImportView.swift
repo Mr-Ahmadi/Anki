@@ -34,7 +34,10 @@ struct ImportView: View {
             .onReceive(NotificationCenter.default.publisher(for: .didReceiveApkgURL)) { note in
                 if let url = note.object as? URL { startImport(url: url) }
             }
-            .onDisappear { importTask?.cancel() }
+            .onDisappear {
+                importTask?.cancel()
+                try? FileManager.default.removeItem(at: DocumentPicker.stagingDirectory)
+            }
         }
     }
 
@@ -223,6 +226,24 @@ struct ImportView: View {
 }
 
 struct DocumentPicker: UIViewControllerRepresentable {
+    /// Where picked files are staged. Cleared when the import screen closes.
+    static var stagingDirectory: URL {
+        FileManager.default.temporaryDirectory.appendingPathComponent("PickedDecks", isDirectory: true)
+    }
+
+    static func stableCopy(of url: URL) -> URL? {
+        let scoped = url.startAccessingSecurityScopedResource()
+        defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+        do {
+            try FileManager.default.createDirectory(at: stagingDirectory, withIntermediateDirectories: true)
+            let destination = stagingDirectory.appendingPathComponent("\(UUID().uuidString)-\(url.lastPathComponent)")
+            try FileManager.default.copyItem(at: url, to: destination)
+            return destination
+        } catch {
+            return nil
+        }
+    }
+
     var onPick: (URL) -> Void
     func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
         let types: [UTType] = [UTType(filenameExtension: "apkg") ?? .zip, .zip, .data]
@@ -238,7 +259,11 @@ struct DocumentPicker: UIViewControllerRepresentable {
         init(onPick: @escaping (URL) -> Void) { self.onPick = onPick }
         func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
             guard let url = urls.first else { return }
-            onPick(url)
+            // `asCopy: true` hands back a file the system owns and may reclaim
+            // once the picker goes away — which, mid-import, leaves the unzip
+            // writing empty files. Take our own copy while the URL is still
+            // guaranteed valid, before this callback returns.
+            onPick(DocumentPicker.stableCopy(of: url) ?? url)
         }
         func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {}
     }
