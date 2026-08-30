@@ -25,7 +25,6 @@
 		AF54B08DAAD97AC09BD8DAE7 /* DeckListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64A710D4A8D087CC0AFF500B /* DeckListView.swift */; };
 		BC7188A390FC2FD2F687A96C /* ZIPFoundation in Frameworks */ = {isa = PBXBuildFile; productRef = D47317311F5DA5710A47C56D /* ZIPFoundation */; };
 		C012BFFDDEE0767417791788 /* StudyView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE6B8BB427C7BB8B7413D2D1 /* StudyView.swift */; };
-		C8A64E2D20A34D1F3DC49939 /* samples in Resources */ = {isa = PBXBuildFile; fileRef = F0C24664BB8A8E8EBA8A6C53 /* samples */; };
 		D3D12BB2CB4D28918DF3D3D8 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3D116F3D5B2544EA996363C3 /* ContentView.swift */; };
 		E1E531C863D24709AAEFD305 /* Scheduler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EAE7549B596EA258B511C52 /* Scheduler.swift */; };
 		E7D0414DD4A0F24CAB03E836 /* CardFaceView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2C1D36DD8FFEBE2D742B747 /* CardFaceView.swift */; };
@@ -73,7 +72,6 @@
 		C9462D5E79FA8F67BFFFAA41 /* StatsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatsView.swift; sourceTree = "<group>"; };
 		D013D6699CB7F9188C22E3F7 /* AnkiCloneTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AnkiCloneTests.swift; sourceTree = "<group>"; };
 		F039DB272639A421038ED0BD /* SpeechService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechService.swift; sourceTree = "<group>"; };
-		F0C24664BB8A8E8EBA8A6C53 /* samples */ = {isa = PBXFileReference; lastKnownFileType = folder; name = samples; path = ../samples; sourceTree = SOURCE_ROOT; };
 		F2C1D36DD8FFEBE2D742B747 /* CardFaceView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CardFaceView.swift; sourceTree = "<group>"; };
 		F5F852A3FB2874512F5887E0 /* StudyFlowUITests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StudyFlowUITests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -108,7 +106,6 @@
 		07F1B211C9175B7204292D97 /* Anki */ = {
 			isa = PBXGroup;
 			children = (
-				F0C24664BB8A8E8EBA8A6C53 /* samples */,
 			);
 			name = Anki;
 			path = ..;
@@ -306,7 +303,6 @@
 			buildActionMask = 2147483647;
 			files = (
 				42CBFAF736E866F7E3CC636B /* Assets.xcassets in Resources */,
-				C8A64E2D20A34D1F3DC49939 /* samples in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

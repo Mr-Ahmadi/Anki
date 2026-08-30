@@ -22,10 +22,6 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - AnkiClone
-      # Ships the two decks in /samples so "try a sample" works on device.
-      - path: ../samples
-        type: folder
-        buildPhase: resources
     settings:
       base:
         INFOPLIST_FILE: AnkiClone/Info.plist

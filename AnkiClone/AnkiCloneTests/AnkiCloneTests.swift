@@ -449,99 +449,207 @@ final class ImportTests: XCTestCase {
     }
 }
 
-// MARK: - Whole-deck corpus
+// MARK: - Whole-package import
 
 import SwiftData
+import SQLite3
+import ZIPFoundation
 
-/// Imports the bundled sample decks for real and runs the analyzer over every
-/// note in them. Unit tests on hand-written strings prove the rules; this proves
-/// they hold across 1,749 notes of messy, real-world deck HTML.
-final class SampleDeckCorpusTests: XCTestCase {
+/// Drives the importer over a real `.apkg` built on the fly, so the zip, the
+/// SQLite read and the SwiftData write are all exercised without shipping a
+/// deck inside the app.
+final class ApkgImportTests: XCTestCase {
+
+    private var workDir: URL!
+
+    override func setUpWithError() throws {
+        workDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: workDir)
+    }
+
+    // MARK: Fixtures
+
+    /// Writes a legacy (uncompressed) collection with `noteCount` Basic notes,
+    /// one card each, split across two decks.
+    private func makeCollection(noteCount: Int, at url: URL) throws {
+        var db: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(url.path, &db), SQLITE_OK)
+        defer { sqlite3_close(db) }
+
+        func exec(_ sql: String) throws {
+            var error: UnsafeMutablePointer<CChar>?
+            guard sqlite3_exec(db, sql, nil, nil, &error) == SQLITE_OK else {
+                let message = error.map { String(cString: $0) } ?? "unknown"
+                sqlite3_free(error)
+                throw NSError(domain: "fixture", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+            }
+        }
+
+        try exec("CREATE TABLE col (id integer primary key, crt integer, decks text, models text, dconf text);")
+        try exec("CREATE TABLE notes (id integer primary key, guid text, mid integer, mod integer, tags text, flds text, sfld text, csum integer);")
+        try exec("CREATE TABLE cards (id integer primary key, nid integer, did integer, ord integer, mod integer, type integer, queue integer, due integer, ivl integer, factor integer, reps integer, lapses integer, left integer, odue integer, flags integer, data text);")
+
+        let decks = """
+        {"1":{"id":1,"name":"Default","desc":"","mod":0,"conf":1},\
+        "1600000000000":{"id":1600000000000,"name":"Vocab::Unit 1","desc":"unit one","mod":0,"conf":1}}
+        """
+        let models = """
+        {"1500000000000":{"id":1500000000000,"name":"Basic","css":".card{}","sortf":0,\
+        "flds":[{"name":"Front","ord":0},{"name":"Back","ord":1}],\
+        "tmpls":[{"ord":0,"name":"Card 1","qfmt":"{{Front}}","afmt":"{{FrontSide}}<hr>{{Back}}"}]}}
+        """
+        try exec("INSERT INTO col (id, crt, decks, models, dconf) VALUES (1, 1600000000, '\(decks)', '\(models)', '{}');")
+
+        for i in 0..<noteCount {
+            let noteId = 1_700_000_000_000 + Int64(i)
+            let deckId = i % 2 == 0 ? 1_600_000_000_000 : 1
+            try exec("""
+            INSERT INTO notes VALUES (\(noteId), 'guid\(i)', 1500000000000, 0, '', 'front \(i)\u{1f}back \(i)', 'front \(i)', 0);
+            """)
+            try exec("""
+            INSERT INTO cards VALUES (\(noteId + 1), \(noteId), \(deckId), 0, 0, 0, 0, \(i), 0, 2500, 0, 0, 0, 0, 0, '');
+            """)
+        }
+    }
+
+    /// Zips `files` (name → contents on disk) into an .apkg.
+    private func makePackage(named name: String, files: [String: URL]) throws -> URL {
+        let packageURL = workDir.appendingPathComponent(name)
+        let archive = try Archive(url: packageURL, accessMode: .create)
+        for (entryName, source) in files {
+            let size = try FileManager.default.attributesOfItem(atPath: source.path)[.size] as? Int ?? 0
+            let handle = try FileHandle(forReadingFrom: source)
+            defer { try? handle.close() }
+            try archive.addEntry(with: entryName, type: .file, uncompressedSize: Int64(size)) { position, requested in
+                try handle.seek(toOffset: UInt64(position))
+                return try handle.read(upToCount: requested) ?? Data()
+            }
+        }
+        return packageURL
+    }
 
     @MainActor
-    private func importSample(named name: String) throws -> ModelContext {
-        let samples = try XCTUnwrap(
-            Bundle.main.url(forResource: "samples", withExtension: nil),
-            "sample decks are not bundled with the app"
-        )
-        let file = samples.appendingPathComponent(name)
-        try XCTSkipUnless(FileManager.default.fileExists(atPath: file.path), "missing \(name)")
-
+    private func freshContext() throws -> ModelContext {
         let container = try ModelContainer(
             for: Deck.self, NoteType.self, Note.self, Card.self, ReviewLog.self,
             configurations: ModelConfiguration(isStoredInMemoryOnly: true)
         )
-        let context = ModelContext(container)
-        let expectation = expectation(description: "import \(name)")
-        Task { @MainActor in
-            _ = try? await ApkgImporter(modelContext: context).import(from: file)
-            expectation.fulfill()
-        }
-        wait(for: [expectation], timeout: 120)
-        return context
+        return ModelContext(container)
+    }
+
+    // MARK: Tests
+
+    @MainActor
+    func testImportsDecksNotesAndCardsAndLinksThem() async throws {
+        let collection = workDir.appendingPathComponent("collection.anki2")
+        try makeCollection(noteCount: 40, at: collection)
+        let package = try makePackage(named: "deck.apkg", files: ["collection.anki2": collection])
+
+        let context = try freshContext()
+        let result = try await ApkgImporter(modelContext: context).import(from: package)
+
+        XCTAssertEqual(result.decksImported, 2)
+        XCTAssertEqual(result.notesImported, 40)
+        XCTAssertEqual(result.cardsImported, 40)
+
+        let cards = try context.fetch(FetchDescriptor<Card>())
+        XCTAssertEqual(cards.count, 40)
+        XCTAssertTrue(cards.allSatisfy { $0.note != nil }, "every card must reach its note")
+        XCTAssertTrue(cards.allSatisfy { $0.deck != nil }, "every card must land in a deck")
+
+        // The inverse relationship must be populated exactly once per card —
+        // the importer used to append to it by hand on top of SwiftData.
+        let decks = try context.fetch(FetchDescriptor<Deck>())
+        XCTAssertEqual(decks.reduce(0) { $0 + $1.cards.count }, 40)
+        let unit = try XCTUnwrap(decks.first { $0.name == "Vocab::Unit 1" })
+        XCTAssertEqual(unit.cards.count, 20)
+        XCTAssertEqual(unit.displayName, "Unit 1")
     }
 
     @MainActor
-    private func analyzeAll(_ context: ModelContext) throws -> [CardContent] {
-        let notes = try context.fetch(FetchDescriptor<Note>())
-        let noteTypes = try context.fetch(FetchDescriptor<NoteType>())
-        XCTAssertFalse(notes.isEmpty, "import produced no notes")
-        return notes.map { note in
-            CardContentAnalyzer.analyze(note: note, noteType: noteTypes.first { $0.ankiId == note.modelId })
+    func testReimportingTheSamePackageAddsNothing() async throws {
+        let collection = workDir.appendingPathComponent("collection.anki2")
+        try makeCollection(noteCount: 10, at: collection)
+        let package = try makePackage(named: "deck.apkg", files: ["collection.anki2": collection])
+
+        let context = try freshContext()
+        let importer = ApkgImporter(modelContext: context)
+        let first = try await importer.import(from: package)
+        let second = try await importer.import(from: package)
+
+        XCTAssertEqual(second.notesImported, 0)
+        XCTAssertEqual(second.cardsImported, 0)
+        XCTAssertEqual(try context.fetch(FetchDescriptor<Card>()).count, 10)
+
+        // Nothing was added, so this must not be reported as a fresh import —
+        // a success screen reading 0/0/0 is what made this look like a failure.
+        XCTAssertTrue(second.isAlreadyImported)
+        XCTAssertEqual(second.notesSkipped, 10)
+        XCTAssertEqual(second.cardsSkipped, 10)
+        XCTAssertEqual(second.notesInPackage, 10)
+
+        XCTAssertFalse(first.isAlreadyImported, "the first import really did add cards")
+        XCTAssertEqual(first.notesSkipped, 0)
+    }
+
+    /// A zstd collection is what Anki 2.1.50+ writes without legacy support.
+    /// SQLite opens it lazily and then fails every query, which used to leave
+    /// the import sitting on "Importing…"; it has to surface as an error.
+    @MainActor
+    func testCompressedCollectionReportsUnsupportedFormat() async throws {
+        let collection = workDir.appendingPathComponent("collection.anki21b")
+        try Data([0x28, 0xB5, 0x2F, 0xFD] + Array(repeating: 0, count: 64)).write(to: collection)
+        let package = try makePackage(named: "new.apkg", files: ["collection.anki21b": collection])
+
+        let context = try freshContext()
+        do {
+            _ = try await ApkgImporter(modelContext: context).import(from: package)
+            XCTFail("a zstd collection must not import silently")
+        } catch ImportError.unsupportedPackageFormat {
+            // expected
         }
     }
 
     @MainActor
-    func testTOEFLDeckParsesIntoWordsAndExamples() throws {
-        let context = try importSample(named: "540_MUST_KNOW_WORDS_FOR_TOEFL_IBT.apkg")
-        let contents = try analyzeAll(context)
+    func testArchiveWithoutACollectionReportsAnError() async throws {
+        let stray = workDir.appendingPathComponent("readme.txt")
+        try Data("nothing to see".utf8).write(to: stray)
+        let package = try makePackage(named: "empty.apkg", files: ["readme.txt": stray])
 
-        XCTAssertEqual(contents.count, 540)
-        // Every note must yield a headword — that is what gets pronounced.
-        XCTAssertTrue(contents.allSatisfy { !$0.headword.isBlank })
-        // No headword may still be carrying its part-of-speech suffix.
-        XCTAssertFalse(contents.contains { $0.headword.hasSuffix(")") && $0.partOfSpeech != nil })
+        let context = try freshContext()
+        do {
+            _ = try await ApkgImporter(modelContext: context).import(from: package)
+            XCTFail("an archive with no collection must not import silently")
+        } catch ImportError.noCollectionFound {
+            // expected
+        }
+    }
 
-        let withDefinition = contents.filter { !$0.definitions.isEmpty }.count
-        let withExamples = contents.filter { !$0.examples.isEmpty }.count
-        XCTAssertEqual(withDefinition, contents.count, "every note in this deck has a Definition field")
-        XCTAssertGreaterThan(Double(withExamples) / Double(contents.count), 0.95, "examples found on \(withExamples)/\(contents.count)")
+    /// The progress callback is what the import screen renders; if it never
+    /// fires the user just sees a spinner.
+    @MainActor
+    func testProgressIsReported() async throws {
+        let collection = workDir.appendingPathComponent("collection.anki2")
+        try makeCollection(noteCount: 600, at: collection)
+        let package = try makePackage(named: "deck.apkg", files: ["collection.anki2": collection])
 
-        // Examples must never leak the bullet that separated them.
-        XCTAssertFalse(contents.contains { content in
-            content.examples.contains { $0.text.unicodeScalars.contains { CardContentAnalyzer.bulletCharacters.contains($0) } }
-        })
-        // A definition must never carry an unsplit bullet: that would mean an
-        // example was left glued to the meaning.
-        XCTAssertFalse(contents.contains { content in
-            content.definitions.contains { $0.unicodeScalars.contains { CardContentAnalyzer.bulletCharacters.contains($0) } }
-        })
+        let messages = Messages()
+        let context = try freshContext()
+        _ = try await ApkgImporter(modelContext: context).import(from: package) { messages.append($0) }
+
+        // Progress hops to the main actor, so let the queued updates land.
+        try await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertFalse(messages.all.isEmpty, "the import must report progress")
+        XCTAssertTrue(messages.all.contains { $0.hasPrefix("Reading collection") })
     }
 
     @MainActor
-    func testBasicVocabularyDeckParsesIntoWordsAndExamples() throws {
-        let context = try importSample(named: "1212 Words.apkg")
-        let contents = try analyzeAll(context)
-
-        XCTAssertEqual(contents.count, 1209)
-        XCTAssertTrue(contents.allSatisfy { !$0.headword.isBlank })
-
-        let usable = contents.filter { $0.isVocabulary }.count
-        XCTAssertGreaterThan(Double(usable) / Double(contents.count), 0.90, "clean layout usable on \(usable)/\(contents.count)")
-
-        // Only 519 of these 1,209 notes mark their examples at all (a list item,
-        // italics or a bullet); the rest are a bare gloss like "hire → employ".
-        // Finding examples on ~45% of the deck is therefore near the ceiling.
-        let withExamples = contents.filter { !$0.examples.isEmpty }.count
-        XCTAssertGreaterThan(Double(withExamples) / Double(contents.count), 0.40, "examples found on \(withExamples)/\(contents.count)")
-
-        // Nothing spoken should still contain markup or a raw URL.
-        for content in contents.prefix(300) {
-            for item in content.answerSpeech {
-                let spoken = SpeechService.speakableText(item.text)
-                XCTAssertFalse(spoken.contains("<"), "markup leaked into speech: \(spoken.prefix(80))")
-                XCTAssertFalse(spoken.contains("http"), "URL leaked into speech: \(spoken.prefix(80))")
-            }
-        }
+    private final class Messages {
+        private(set) var all: [String] = []
+        func append(_ message: String) { all.append(message) }
     }
 }

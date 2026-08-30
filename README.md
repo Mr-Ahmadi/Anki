@@ -96,16 +96,17 @@ xcodebuild test -project AnkiClone.xcodeproj -scheme AnkiClone \
 
 ## Tests
 
-46 unit tests and 3 UI tests, all passing.
+49 unit tests and 2 UI tests, all passing.
 
 The unit tests cover template rendering, the HTML scanner, the content analyzer, language
-detection, the scheduler and due-date conversion. Two of them are **corpus tests**: they import the
-two bundled sample decks for real and run the analyzer over all 1,749 notes, asserting that
+detection, the scheduler and due-date conversion, working from note fields copied verbatim out of
+real decks.
 
-- every one of the 540 TOEFL notes yields a headword and a definition, and >95% yield examples;
-- no example still carries the bullet that separated it, and no definition has swallowed one;
-- >90% of the 1,209-note deck parses into the clean layout;
-- nothing handed to the speech synthesiser still contains markup or a URL.
+A suite drives the importer over a real `.apkg` built on the fly, so the zip, the SQLite read and
+the SwiftData write are exercised without shipping a deck inside the app: decks, notes and cards
+land and are linked both ways, re-importing the same package adds nothing and says so, progress is
+reported, and the two packages that cannot be read — a zstd collection and an archive with no collection at
+all — surface as errors rather than a stalled spinner.
 
 A dedicated suite covers what must never reach the synthesiser: tags, tags that only appear after
 entity decoding (`&lt;div&gt;`, and the double-encoded `&amp;lt;div&amp;gt;` that scraper exports
@@ -114,15 +115,22 @@ produce), unterminated tags, `<script>` and `<style>` bodies, attribute values c
 A real inequality in a card — "5 < 6" — still has to survive, so a `<` only starts a tag when a
 name follows it.
 
-The UI tests drive the real app: import a bundled deck, open it, reveal an answer, check that the
-word, the meaning and the examples are separate and separately playable, and answer a card.
+The UI tests drive the real app: opening the import sheet from the empty deck list, and reaching
+the pronunciation settings. Studying is not covered end to end, because getting cards in now
+requires picking a file from the system document picker.
 
 ## Importing your own decks
 
 - **In the app:** Decks → `+` → Import deck…
 - **From Files or another app:** share an `.apkg` to AnkiClone
-- **To try it out:** the two decks in `samples/` are bundled with the app and offered on the import
-  screen
+
+Import runs off the main thread and reports progress as it goes; large decks stay cancellable.
+Notes and cards are matched on their Anki id, so importing a package you already have adds nothing
+and leaves your scheduling alone — the import screen says "Already Imported" rather than showing a
+success screen full of zeroes.
+Packages exported by Anki 2.1.50+ *without* "Support older Anki versions" store the collection as a
+zstd blob, which this app cannot read — it says so rather than stalling, and the fix is to
+re-export with that box checked.
 
 Media is extracted to `ApplicationSupport/AnkiMedia` and served to the web view as its base URL.
 

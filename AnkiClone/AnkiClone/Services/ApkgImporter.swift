@@ -9,6 +9,8 @@ enum ImportError: LocalizedError {
     case sqliteOpenFailed
     case sqliteError(String)
     case noCollectionFound
+    case unsupportedPackageFormat
+    case emptyCollection
     case cancelled
 
     var errorDescription: String? {
@@ -18,6 +20,9 @@ enum ImportError: LocalizedError {
         case .sqliteOpenFailed: return "Failed to open database"
         case .sqliteError(let s): return "Database error: \(s)"
         case .noCollectionFound: return "No collection found in archive"
+        case .unsupportedPackageFormat:
+            return "This package uses Anki's newest (compressed) export format, which this app cannot read yet. In Anki Desktop re-export the deck with “Support older Anki versions” checked."
+        case .emptyCollection: return "The archive opened, but contains no notes or cards"
         case .cancelled: return "Import cancelled"
         }
     }
@@ -29,6 +34,20 @@ struct ImportResult {
     var cardsImported: Int
     var mediaFiles: Int
     var deckNames: [String]
+    /// Rows the package contained that were already in the collection. Notes
+    /// and cards are matched on their Anki id, so re-importing is a no-op.
+    var notesSkipped: Int = 0
+    var cardsSkipped: Int = 0
+
+    var notesInPackage: Int { notesImported + notesSkipped }
+    var cardsInPackage: Int { cardsImported + cardsSkipped }
+
+    /// The package read fine but added nothing, because all of it was already
+    /// imported. That is not the same as a successful import and must not be
+    /// reported as one.
+    var isAlreadyImported: Bool {
+        notesImported == 0 && cardsImported == 0 && (notesSkipped > 0 || cardsSkipped > 0)
+    }
 }
 
 // MARK: - ApkgImporter
@@ -36,48 +55,67 @@ struct ImportResult {
 final class ApkgImporter {
 
     private let modelContext: ModelContext
-    private let fileManager = FileManager.default
 
     init(modelContext: ModelContext) {
         self.modelContext = modelContext
     }
 
-    // Main entry — call from background thread, but ModelContext must be used on its actor.
-    // We use @MainActor for SwiftData operations.
-    @MainActor
-    func `import`(from url: URL) async throws -> ImportResult {
-        // Security-scoped access for file picker URLs
+    /// Unzipping, media copying and SQLite parsing all happen off the main
+    /// actor; only the SwiftData writes run on it. `progress` is called on the
+    /// main actor so it can drive the UI.
+    func `import`(from url: URL, progress: @escaping @MainActor (String) -> Void = { _ in }) async throws -> ImportResult {
+        let report: @Sendable (String) -> Void = { message in
+            Task { @MainActor in progress(message) }
+        }
+
+        // This method is nonisolated, so its body runs on the cooperative pool
+        // rather than the caller's actor: unzipping and SQLite never touch main.
+        let staged = try Self.stage(url: url, report: report)
+
+        return try await importParsedData(staged.parsed, mediaFiles: staged.mediaFiles, report: report)
+    }
+
+    // MARK: - Staging (off the main actor)
+
+    struct StagedCollection: @unchecked Sendable {
+        var parsed: ParsedData
+        var mediaFiles: Int
+    }
+
+    private static func stage(url: URL, report: @Sendable (String) -> Void) throws -> StagedCollection {
+        let fileManager = FileManager.default
+
+        // Security-scoped access for file picker URLs.
         let didStart = url.startAccessingSecurityScopedResource()
         defer { if didStart { url.stopAccessingSecurityScopedResource() } }
 
-        // Copy to temp if needed
         let tempDir = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try fileManager.createDirectory(at: tempDir, withIntermediateDirectories: true)
-
         defer { try? fileManager.removeItem(at: tempDir) }
 
-        // Unzip
-        try unzipApkg(at: url, to: tempDir)
+        report("Unzipping \(url.lastPathComponent)…")
+        try unzipApkg(at: url, to: tempDir, report: report)
+        try Task.checkCancellation()
 
-        // Locate collection file
-        let collectionURL = findCollection(in: tempDir)
-        guard let collectionURL else { throw ImportError.noCollectionFound }
+        report("Locating collection…")
+        guard let collectionURL = try findCollection(in: tempDir) else { throw ImportError.noCollectionFound }
 
-        // Parse media mapping (if exists)
         let mediaMap = parseMediaMap(in: tempDir)
-        // Copy media files to app support
-        let mediaDest = try copyMediaFiles(mediaMap: mediaMap, sourceDir: tempDir)
+        if !mediaMap.isEmpty { report("Copying \(mediaMap.count) media files…") }
+        let mediaFiles = copyMediaFiles(mediaMap: mediaMap, sourceDir: tempDir)
+        try Task.checkCancellation()
 
-        // Parse SQLite
-        let parsed = try parseCollection(at: collectionURL)
+        report("Reading collection…")
+        let parsed = try parseCollection(at: collectionURL, report: report)
+        guard !parsed.notes.isEmpty || !parsed.cards.isEmpty else { throw ImportError.emptyCollection }
 
-        // Import to SwiftData
-        return try importParsedData(parsed, mediaDest: mediaDest)
+        return StagedCollection(parsed: parsed, mediaFiles: mediaFiles)
     }
 
     // MARK: - Unzip
 
-    private func unzipApkg(at sourceURL: URL, to destDir: URL) throws {
+    private static func unzipApkg(at sourceURL: URL, to destDir: URL, report: @Sendable (String) -> Void) throws {
+        let fileManager = FileManager.default
         guard fileManager.fileExists(atPath: sourceURL.path) else { throw ImportError.invalidFile }
 
         let archive: Archive
@@ -87,48 +125,72 @@ final class ApkgImporter {
             throw ImportError.unzipFailed("Cannot open archive: \(error.localizedDescription)")
         }
 
+        let root = destDir.standardizedFileURL.path
+        var extracted = 0
         for entry in archive {
-            let destURL = destDir.appendingPathComponent(entry.path)
+            try Task.checkCancellation()
+
+            let destURL = destDir.appendingPathComponent(entry.path).standardizedFileURL
             // Prevent directory traversal
-            guard destURL.path.hasPrefix(destDir.path) else { continue }
+            guard destURL.path.hasPrefix(root) else { continue }
 
             if entry.type == .directory {
                 try fileManager.createDirectory(at: destURL, withIntermediateDirectories: true)
                 continue
             }
 
-            // Ensure parent exists
             try fileManager.createDirectory(at: destURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-
-            // Remove if exists
             if fileManager.fileExists(atPath: destURL.path) {
                 try fileManager.removeItem(at: destURL)
             }
 
             do {
-                _ = try archive.extract(entry, to: destURL)
+                _ = try archive.extract(entry, to: destURL, skipCRC32: true)
             } catch {
                 throw ImportError.unzipFailed(error.localizedDescription)
             }
+
+            extracted += 1
+            if extracted % 200 == 0 { report("Unzipping… \(extracted) files") }
         }
     }
 
-    private func findCollection(in dir: URL) -> URL? {
-        let candidates = ["collection.anki21", "collection.anki21b", "collection.anki2"]
-        for name in candidates {
-            let url = dir.appendingPathComponent(name)
-            if fileManager.fileExists(atPath: url.path) { return url }
+    /// Picks the first candidate that really is a SQLite database. Anki 2.1.50+
+    /// writes `collection.anki21b` as a zstd blob, which SQLite would open
+    /// lazily and then fail on every query — that used to look like a hang.
+    private static func findCollection(in dir: URL) throws -> URL? {
+        let fileManager = FileManager.default
+        var candidates = ["collection.anki21", "collection.anki2", "collection.anki21b"]
+            .map { dir.appendingPathComponent($0) }
+            .filter { fileManager.fileExists(atPath: $0.path) }
+
+        if candidates.isEmpty, let files = try? fileManager.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+            candidates = files.filter { $0.lastPathComponent.hasPrefix("collection.anki") }
         }
-        // fallback: any .anki* file
-        if let files = try? fileManager.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
-            return files.first(where: { $0.lastPathComponent.hasPrefix("collection.anki") })
-        }
+        guard !candidates.isEmpty else { return nil }
+
+        if let usable = candidates.first(where: { isSQLiteDatabase(at: $0) }) { return usable }
+        if candidates.contains(where: { isZstdCompressed(at: $0) }) { throw ImportError.unsupportedPackageFormat }
         return nil
+    }
+
+    private static func header(of url: URL, count: Int) -> [UInt8] {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return [] }
+        defer { try? handle.close() }
+        return Array((try? handle.read(upToCount: count)) ?? Data())
+    }
+
+    private static func isSQLiteDatabase(at url: URL) -> Bool {
+        header(of: url, count: 16) == Array("SQLite format 3\0".utf8)
+    }
+
+    private static func isZstdCompressed(at url: URL) -> Bool {
+        header(of: url, count: 4) == [0x28, 0xB5, 0x2F, 0xFD]
     }
 
     // MARK: - Media
 
-    private func parseMediaMap(in dir: URL) -> [String: String] {
+    private static func parseMediaMap(in dir: URL) -> [String: String] {
         // media file is JSON: {"0": "image.jpg", "1": "audio.mp3"}
         let mediaURL = dir.appendingPathComponent("media")
         guard let data = try? Data(contentsOf: mediaURL),
@@ -138,10 +200,11 @@ final class ApkgImporter {
         return json
     }
 
-    private func copyMediaFiles(mediaMap: [String: String], sourceDir: URL) throws -> URL {
-        let dest = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("AnkiMedia", isDirectory: true)
-        try fileManager.createDirectory(at: dest, withIntermediateDirectories: true)
+    private static func copyMediaFiles(mediaMap: [String: String], sourceDir: URL) -> Int {
+        let fileManager = FileManager.default
+        guard let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return 0 }
+        let dest = support.appendingPathComponent("AnkiMedia", isDirectory: true)
+        guard (try? fileManager.createDirectory(at: dest, withIntermediateDirectories: true)) != nil else { return 0 }
 
         var copied = 0
         for (key, filename) in mediaMap {
@@ -149,89 +212,97 @@ final class ApkgImporter {
             guard fileManager.fileExists(atPath: src.path) else { continue }
             // Sanitize filename
             let safeName = filename.replacingOccurrences(of: "/", with: "_")
+            guard !safeName.isEmpty, safeName != ".", safeName != ".." else { continue }
             let dst = dest.appendingPathComponent(safeName)
             if fileManager.fileExists(atPath: dst.path) {
                 try? fileManager.removeItem(at: dst)
             }
-            try? fileManager.copyItem(at: src, to: dst)
-            copied += 1
+            if (try? fileManager.copyItem(at: src, to: dst)) != nil { copied += 1 }
         }
-        return dest
+        return copied
     }
 
     // MARK: - SQLite Parsing
 
-    struct ParsedData {
+    struct ParsedData: Sendable {
         var decks: [ParsedDeck]
         var models: [ParsedModel]
         var notes: [ParsedNote]
         var cards: [ParsedCard]
         var collectionCreation: Int64 // crt
-        var deckConfigs: [String: Any] // dconf
     }
 
-    struct ParsedDeck { let id: Int64; let name: String; let desc: String; let mod: Int64; let collapsed: Bool; let conf: Int64 }
-    struct ParsedModel {
+    struct ParsedDeck: Sendable { let id: Int64; let name: String; let desc: String; let mod: Int64; let collapsed: Bool; let conf: Int64 }
+    struct ParsedModel: Sendable {
         let id: Int64; let name: String; let css: String
         let fieldNames: [String]; let templates: [CardTemplateData]; let sortf: Int
     }
-    struct ParsedNote { let id: Int64; let guid: String; let mid: Int64; let mod: Int64; let tags: String; let flds: String; let sfld: String; let csum: Int64 }
-    struct ParsedCard { let id: Int64; let nid: Int64; let did: Int64; let ord: Int; let mod: Int64; let type: Int; let queue: Int; let due: Int64; let ivl: Int; let factor: Int; let reps: Int; let lapses: Int; let left: Int; let odue: Int64; let flags: Int; let data: String }
+    struct ParsedNote: Sendable { let id: Int64; let guid: String; let mid: Int64; let mod: Int64; let tags: String; let flds: String; let sfld: String; let csum: Int64 }
+    struct ParsedCard: Sendable { let id: Int64; let nid: Int64; let did: Int64; let ord: Int; let mod: Int64; let type: Int; let queue: Int; let due: Int64; let ivl: Int; let factor: Int; let reps: Int; let lapses: Int; let left: Int; let odue: Int64; let flags: Int; let data: String }
 
-    private func parseCollection(at url: URL) throws -> ParsedData {
+    private static func parseCollection(at url: URL, report: @Sendable (String) -> Void) throws -> ParsedData {
         var db: OpaquePointer?
-        guard sqlite3_open(url.path, &db) == SQLITE_OK, let db else { throw ImportError.sqliteOpenFailed }
+        guard sqlite3_open_v2(url.path, &db, SQLITE_OPEN_READONLY, nil) == SQLITE_OK, let db else {
+            sqlite3_close(db)
+            throw ImportError.sqliteOpenFailed
+        }
         defer { sqlite3_close(db) }
+
+        func lastError() -> String { String(cString: sqlite3_errmsg(db)) }
 
         // Read col table
         var decks: [ParsedDeck] = []
         var models: [ParsedModel] = []
         var crt: Int64 = 0
-        var deckConfigs: [String: Any] = [:]
 
-        let colSQL = "SELECT crt, decks, models, dconf FROM col LIMIT 1;"
+        let colSQL = "SELECT crt, decks, models FROM col LIMIT 1;"
         var stmt: OpaquePointer?
-        if sqlite3_prepare_v2(db, colSQL, -1, &stmt, nil) == SQLITE_OK, sqlite3_step(stmt) == SQLITE_ROW {
+        guard sqlite3_prepare_v2(db, colSQL, -1, &stmt, nil) == SQLITE_OK else {
+            let message = lastError()
+            sqlite3_finalize(stmt)
+            throw ImportError.sqliteError(message)
+        }
+        if sqlite3_step(stmt) == SQLITE_ROW {
             crt = sqlite3_column_int64(stmt, 0)
             if let decksText = sqlite3_column_text(stmt, 1) {
-                let s = String(cString: decksText)
-                decks = parseDecksJSON(s)
+                decks = parseDecksJSON(String(cString: decksText))
             }
             if let modelsText = sqlite3_column_text(stmt, 2) {
-                let s = String(cString: modelsText)
-                models = parseModelsJSON(s)
-            }
-            if let dconfText = sqlite3_column_text(stmt, 3) {
-                let s = String(cString: dconfText)
-                if let data = s.data(using: .utf8),
-                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    deckConfigs = obj
-                }
+                models = parseModelsJSON(String(cString: modelsText))
             }
         }
         sqlite3_finalize(stmt)
+
+        // Newer collections keep decks/notetypes in their own tables and leave
+        // the legacy JSON columns empty.
+        if decks.isEmpty { decks = parseDeckTable(db) }
 
         // Notes
         var notes: [ParsedNote] = []
         var noteStmt: OpaquePointer?
         let noteSQL = "SELECT id, guid, mid, mod, tags, flds, sfld, csum FROM notes;"
-        if sqlite3_prepare_v2(db, noteSQL, -1, &noteStmt, nil) == SQLITE_OK {
-            while sqlite3_step(noteStmt) == SQLITE_ROW {
-                let id = sqlite3_column_int64(noteStmt, 0)
-                let guid = String(cString: sqlite3_column_text(noteStmt, 1))
-                let mid = sqlite3_column_int64(noteStmt, 2)
-                let mod = sqlite3_column_int64(noteStmt, 3)
-                let tags = sqlite3_column_text(noteStmt, 4).map { String(cString: $0) } ?? ""
-                let flds = sqlite3_column_text(noteStmt, 5).map { String(cString: $0) } ?? ""
-                let sfld: String
-                if sqlite3_column_type(noteStmt, 6) == SQLITE_TEXT {
-                    sfld = String(cString: sqlite3_column_text(noteStmt, 6))
-                } else {
-                    sfld = "\(sqlite3_column_int64(noteStmt, 6))"
-                }
-                let csum = sqlite3_column_int64(noteStmt, 7)
-                notes.append(ParsedNote(id: id, guid: guid, mid: mid, mod: mod, tags: tags, flds: flds, sfld: sfld, csum: csum))
+        guard sqlite3_prepare_v2(db, noteSQL, -1, &noteStmt, nil) == SQLITE_OK else {
+            let message = lastError()
+            sqlite3_finalize(noteStmt)
+            throw ImportError.sqliteError(message)
+        }
+        while sqlite3_step(noteStmt) == SQLITE_ROW {
+            try Task.checkCancellation()
+            let id = sqlite3_column_int64(noteStmt, 0)
+            let guid = sqlite3_column_text(noteStmt, 1).map { String(cString: $0) } ?? ""
+            let mid = sqlite3_column_int64(noteStmt, 2)
+            let mod = sqlite3_column_int64(noteStmt, 3)
+            let tags = sqlite3_column_text(noteStmt, 4).map { String(cString: $0) } ?? ""
+            let flds = sqlite3_column_text(noteStmt, 5).map { String(cString: $0) } ?? ""
+            let sfld: String
+            if sqlite3_column_type(noteStmt, 6) == SQLITE_TEXT {
+                sfld = String(cString: sqlite3_column_text(noteStmt, 6))
+            } else {
+                sfld = "\(sqlite3_column_int64(noteStmt, 6))"
             }
+            let csum = sqlite3_column_int64(noteStmt, 7)
+            notes.append(ParsedNote(id: id, guid: guid, mid: mid, mod: mod, tags: tags, flds: flds, sfld: sfld, csum: csum))
+            if notes.count % 1000 == 0 { report("Read \(notes.count) notes…") }
         }
         sqlite3_finalize(noteStmt)
 
@@ -239,39 +310,66 @@ final class ApkgImporter {
         var cards: [ParsedCard] = []
         var cardStmt: OpaquePointer?
         let cardSQL = "SELECT id, nid, did, ord, mod, type, queue, due, ivl, factor, reps, lapses, left, odue, flags, data FROM cards;"
-        if sqlite3_prepare_v2(db, cardSQL, -1, &cardStmt, nil) == SQLITE_OK {
-            while sqlite3_step(cardStmt) == SQLITE_ROW {
-                let id = sqlite3_column_int64(cardStmt, 0)
-                let nid = sqlite3_column_int64(cardStmt, 1)
-                let did = sqlite3_column_int64(cardStmt, 2)
-                let ord = Int(sqlite3_column_int(cardStmt, 3))
-                let mod = sqlite3_column_int64(cardStmt, 4)
-                let type = Int(sqlite3_column_int(cardStmt, 5))
-                let queue = Int(sqlite3_column_int(cardStmt, 6))
-                let due = sqlite3_column_int64(cardStmt, 7)
-                let ivl = Int(sqlite3_column_int(cardStmt, 8))
-                let factor = Int(sqlite3_column_int(cardStmt, 9))
-                let reps = Int(sqlite3_column_int(cardStmt, 10))
-                let lapses = Int(sqlite3_column_int(cardStmt, 11))
-                let left = Int(sqlite3_column_int(cardStmt, 12))
-                let odue = sqlite3_column_int64(cardStmt, 13)
-                let flags = Int(sqlite3_column_int(cardStmt, 14))
-                let data = sqlite3_column_text(cardStmt, 15).map { String(cString: $0) } ?? ""
-                cards.append(ParsedCard(id: id, nid: nid, did: did, ord: ord, mod: mod, type: type, queue: queue, due: due, ivl: ivl, factor: factor, reps: reps, lapses: lapses, left: left, odue: odue, flags: flags, data: data))
-            }
+        guard sqlite3_prepare_v2(db, cardSQL, -1, &cardStmt, nil) == SQLITE_OK else {
+            let message = lastError()
+            sqlite3_finalize(cardStmt)
+            throw ImportError.sqliteError(message)
+        }
+        while sqlite3_step(cardStmt) == SQLITE_ROW {
+            try Task.checkCancellation()
+            let id = sqlite3_column_int64(cardStmt, 0)
+            let nid = sqlite3_column_int64(cardStmt, 1)
+            let did = sqlite3_column_int64(cardStmt, 2)
+            let ord = Int(sqlite3_column_int(cardStmt, 3))
+            let mod = sqlite3_column_int64(cardStmt, 4)
+            let type = Int(sqlite3_column_int(cardStmt, 5))
+            let queue = Int(sqlite3_column_int(cardStmt, 6))
+            let due = sqlite3_column_int64(cardStmt, 7)
+            let ivl = Int(sqlite3_column_int(cardStmt, 8))
+            let factor = Int(sqlite3_column_int(cardStmt, 9))
+            let reps = Int(sqlite3_column_int(cardStmt, 10))
+            let lapses = Int(sqlite3_column_int(cardStmt, 11))
+            let left = Int(sqlite3_column_int(cardStmt, 12))
+            let odue = sqlite3_column_int64(cardStmt, 13)
+            let flags = Int(sqlite3_column_int(cardStmt, 14))
+            let data = sqlite3_column_text(cardStmt, 15).map { String(cString: $0) } ?? ""
+            cards.append(ParsedCard(id: id, nid: nid, did: did, ord: ord, mod: mod, type: type, queue: queue, due: due, ivl: ivl, factor: factor, reps: reps, lapses: lapses, left: left, odue: odue, flags: flags, data: data))
+            if cards.count % 1000 == 0 { report("Read \(cards.count) cards…") }
         }
         sqlite3_finalize(cardStmt)
 
-        return ParsedData(decks: decks, models: models, notes: notes, cards: cards, collectionCreation: crt, deckConfigs: deckConfigs)
+        return ParsedData(decks: decks, models: models, notes: notes, cards: cards, collectionCreation: crt)
     }
 
-    private func parseDecksJSON(_ json: String) -> [ParsedDeck] {
+    /// Anki 2.1.28+ moved decks into a real table; the `col.decks` JSON blob is
+    /// then "{}" and we would otherwise import everything into one Default deck.
+    private static func parseDeckTable(_ db: OpaquePointer) -> [ParsedDeck] {
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "SELECT id, name, mtime_secs FROM decks;", -1, &stmt, nil) == SQLITE_OK else {
+            sqlite3_finalize(stmt)
+            return []
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        var out: [ParsedDeck] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let id = sqlite3_column_int64(stmt, 0)
+            // The table stores subdeck separators as \u{1f}, not "::".
+            let raw = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "Deck \(id)"
+            let name = raw.replacingOccurrences(of: "\u{1f}", with: "::")
+            let mod = sqlite3_column_int64(stmt, 2)
+            out.append(ParsedDeck(id: id, name: name, desc: "", mod: mod, collapsed: false, conf: 1))
+        }
+        return out
+    }
+
+    private static func parseDecksJSON(_ json: String) -> [ParsedDeck] {
         guard let data = json.data(using: .utf8),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
         var out: [ParsedDeck] = []
         for (_, v) in dict {
             guard let d = v as? [String: Any],
-                  let id = d["id"] as? Int64 ?? (d["id"] as? Int).map(Int64.init) ?? (d["id"] as? NSNumber)?.int64Value
+                  let id = (d["id"] as? NSNumber)?.int64Value
             else { continue }
             let name = d["name"] as? String ?? "Deck \(id)"
             let desc = d["desc"] as? String ?? ""
@@ -283,13 +381,13 @@ final class ApkgImporter {
         return out
     }
 
-    private func parseModelsJSON(_ json: String) -> [ParsedModel] {
+    private static func parseModelsJSON(_ json: String) -> [ParsedModel] {
         guard let data = json.data(using: .utf8),
               let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return [] }
         var out: [ParsedModel] = []
         for (_, v) in dict {
             guard let m = v as? [String: Any],
-                  let id = (m["id"] as? NSNumber)?.int64Value ?? (m["id"] as? Int).map(Int64.init)
+                  let id = (m["id"] as? NSNumber)?.int64Value
             else { continue }
             let name = m["name"] as? String ?? "Model \(id)"
             let css = m["css"] as? String ?? ""
@@ -319,18 +417,18 @@ final class ApkgImporter {
     // MARK: - Import to SwiftData
 
     @MainActor
-    private func importParsedData(_ parsed: ParsedData, mediaDest: URL) throws -> ImportResult {
-        // We need to handle duplicate handling: if deck with same ankiId exists, update or skip?
-        // For MVP: skip existing cards/notes by ankiId.
-
-        // Fetch existing IDs to avoid duplicates
+    private func importParsedData(
+        _ parsed: ParsedData,
+        mediaFiles: Int,
+        report: @Sendable (String) -> Void
+    ) async throws -> ImportResult {
+        // Existing rows are skipped by ankiId, so re-importing a deck is a no-op.
         let existingDecks = try modelContext.fetch(FetchDescriptor<Deck>())
         let existingNotes = try modelContext.fetch(FetchDescriptor<Note>())
-        let existingCards = try modelContext.fetch(FetchDescriptor<Card>())
         let existingModels = try modelContext.fetch(FetchDescriptor<NoteType>())
+        let existingCardIds = Set(try modelContext.fetch(FetchDescriptor<Card>()).map(\.ankiId))
         let existingDeckIds = Set(existingDecks.map(\.ankiId))
         let existingNoteIds = Set(existingNotes.map(\.ankiId))
-        let existingCardIds = Set(existingCards.map(\.ankiId))
         let existingModelIds = Set(existingModels.map(\.ankiId))
 
         // Import models
@@ -347,7 +445,6 @@ final class ApkgImporter {
         for d in existingDecks { deckMap[d.ankiId] = d }
         var decksImported = 0
         for d in parsed.decks where !existingDeckIds.contains(d.id) {
-            // Filter out Default deck if empty? Keep it.
             let deck = Deck(ankiId: d.id, name: d.name, desc: d.desc, mod: d.mod, collapsed: d.collapsed, confId: d.conf)
             modelContext.insert(deck)
             deckMap[d.id] = deck
@@ -365,20 +462,30 @@ final class ApkgImporter {
         var noteMap: [Int64: Note] = [:]
         for n in existingNotes { noteMap[n.ankiId] = n }
         var notesImported = 0
-        for n in parsed.notes where !existingNoteIds.contains(n.id) {
+        let newNotes = parsed.notes.filter { !existingNoteIds.contains($0.id) }
+        for n in newNotes {
+            try Task.checkCancellation()
             // flds is \u{1f} separated
             let fields = n.flds.components(separatedBy: "\u{1f}")
             let note = Note(ankiId: n.id, guid: n.guid, modelId: n.mid, mod: n.mod, tags: n.tags, fieldValues: fields, sortField: n.sfld, checksum: n.csum)
             modelContext.insert(note)
             noteMap[n.id] = note
             notesImported += 1
+            if notesImported % 250 == 0 {
+                report("Saving notes… \(notesImported)/\(newNotes.count)")
+                await Task.yield()
+            }
         }
 
         // Import cards
         var cardsImported = 0
         let crtDate = Date(timeIntervalSince1970: TimeInterval(parsed.collectionCreation))
         let now = Date()
-        for c in parsed.cards where !existingCardIds.contains(c.id) {
+        let fallbackDeck = deckMap[1] ?? deckMap.values.first
+        let newCards = parsed.cards.filter { !existingCardIds.contains($0.id) }
+        var cardsByDeck: [Int64: [Card]] = [:]
+        for c in newCards {
+            try Task.checkCancellation()
             let dueDate = Self.computeDueDate(due: c.due, ivl: c.ivl, type: c.type, queue: c.queue, crt: crtDate, now: now)
             let card = Card(
                 ankiId: c.id,
@@ -399,23 +506,34 @@ final class ApkgImporter {
                 deckId: c.did,
                 noteId: c.nid
             )
-            // Link relationships
-            card.deck = deckMap[c.did] ?? deckMap.values.first
-            card.note = noteMap[c.nid]
-            card.deck?.cards.append(card)
-            card.note?.cards.append(card)
             modelContext.insert(card)
+            card.note = noteMap[c.nid]
+            // The deck side is filled in one batch below: assigning card.deck
+            // per card re-materialises the deck's whole cards array each time,
+            // which is what made a few thousand cards take minutes.
+            cardsByDeck[(deckMap[c.did] ?? fallbackDeck)?.ankiId ?? 1, default: []].append(card)
             cardsImported += 1
+            if cardsImported % 250 == 0 {
+                report("Saving cards… \(cardsImported)/\(newCards.count)")
+                await Task.yield()
+            }
         }
 
+        for (deckId, cards) in cardsByDeck {
+            deckMap[deckId]?.cards.append(contentsOf: cards)
+        }
+
+        report("Finishing…")
         try modelContext.save()
 
         return ImportResult(
             decksImported: decksImported,
             notesImported: notesImported,
             cardsImported: cardsImported,
-            mediaFiles: (try? FileManager.default.contentsOfDirectory(at: mediaDest, includingPropertiesForKeys: nil).count) ?? 0,
-            deckNames: parsed.decks.map(\.name)
+            mediaFiles: mediaFiles,
+            deckNames: parsed.decks.map(\.name),
+            notesSkipped: parsed.notes.count - notesImported,
+            cardsSkipped: parsed.cards.count - cardsImported
         )
     }
 

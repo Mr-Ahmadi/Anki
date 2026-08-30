@@ -131,9 +131,7 @@ struct DeckListView: View {
                 .padding(.horizontal, 20)
                 .padding(.top, 8)
 
-                Text("Samples in /samples are available on Simulator")
-                    .font(.caption2).foregroundStyle(.tertiary)
-                    .padding(.bottom, 24)
+                Spacer(minLength: 24)
             }
         }
         .background(Color(.secondarySystemGroupedBackground))

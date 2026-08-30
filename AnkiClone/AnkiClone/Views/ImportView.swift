@@ -12,12 +12,13 @@ struct ImportView: View {
     @State private var result: ImportResult?
     @State private var errorMessage: String?
     @State private var pendingURL: URL?
+    @State private var importTask: Task<Void, Never>?
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 20) {
                 if isImporting { importingView }
-                else if let result { successView(result) }
+                else if let result { resultView(result) }
                 else if let errorMessage { errorView(errorMessage) }
                 else { promptView }
             }
@@ -28,14 +29,12 @@ struct ImportView: View {
                 ToolbarItem(placement: .cancellationAction) { Button("Close") { dismiss() } }
             }
             .sheet(isPresented: $showPicker) {
-                DocumentPicker { url in
-                    pendingURL = url
-                    Task { await doImport(url: url) }
-                }
+                DocumentPicker { url in startImport(url: url) }
             }
             .onReceive(NotificationCenter.default.publisher(for: .didReceiveApkgURL)) { note in
-                if let url = note.object as? URL { Task { await doImport(url: url) } }
+                if let url = note.object as? URL { startImport(url: url) }
             }
+            .onDisappear { importTask?.cancel() }
         }
     }
 
@@ -79,28 +78,6 @@ struct ImportView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
-                let samples = sampleApkgs()
-                if !samples.isEmpty {
-                    VStack(alignment: .leading, spacing: 10) {
-                        Label("Try a sample deck", systemImage: "doc.zipper").font(.caption.weight(.semibold)).foregroundStyle(.indigo)
-                        ForEach(samples, id: \.lastPathComponent) { url in
-                            Button { Task { await doImport(url: url) } } label: {
-                                HStack {
-                                    Image(systemName: "doc.fill").foregroundStyle(.indigo)
-                                    Text(url.deletingPathExtension().lastPathComponent).font(.subheadline.weight(.medium))
-                                    Spacer()
-                                    Image(systemName: "arrow.right.circle.fill").foregroundStyle(.secondary)
-                                }
-                                .padding(.horizontal, 12).padding(.vertical, 10)
-                                .background(RoundedRectangle(cornerRadius: 12).fill(Color(.secondarySystemGroupedBackground)))
-                                .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color(.separator).opacity(0.08), lineWidth: 1))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
                 Text("Your data stays on-device. Media is saved to App Support/AnkiMedia.")
                     .font(.caption2).foregroundStyle(.tertiary).multilineTextAlignment(.center)
             }
@@ -114,10 +91,50 @@ struct ImportView: View {
             VStack(spacing: 6) {
                 Text("Importing…").font(.headline)
                 Text(progressMessage).font(.caption).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                    .animation(nil, value: progressMessage)
                 Text("This may take a moment for large decks.").font(.caption2).foregroundStyle(.tertiary)
             }
+            Button("Cancel", role: .cancel) { importTask?.cancel() }
+                .buttonStyle(.bordered)
+                .padding(.top, 4)
         }
         .frame(maxHeight: .infinity, alignment: .center)
+    }
+
+    @ViewBuilder
+    private func resultView(_ r: ImportResult) -> some View {
+        if r.isAlreadyImported { alreadyImportedView(r) } else { successView(r) }
+    }
+
+    /// The package read fine but added nothing: everything in it was already in
+    /// the collection. Showing the normal success screen here just reads as a
+    /// row of zeroes, which looks like a failed import.
+    private func alreadyImportedView(_ r: ImportResult) -> some View {
+        VStack(spacing: 16) {
+            ZStack {
+                Circle().fill(Color.blue.opacity(0.10)).frame(width: 88, height: 88)
+                Image(systemName: "checkmark.circle.badge.questionmark")
+                    .font(.system(size: 50)).foregroundStyle(.blue)
+            }
+            Text("Already Imported").font(.title2.weight(.bold))
+            Text("All \(r.notesInPackage) notes and \(r.cardsInPackage) cards in this package are already in your collection, so nothing was added. Your scheduling was left untouched.")
+                .font(.subheadline).foregroundStyle(.secondary)
+                .multilineTextAlignment(.center).padding(.horizontal)
+            if !r.deckNames.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(r.deckNames, id: \.self) { name in
+                            Label(name, systemImage: "rectangle.stack.fill").font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                .frame(maxHeight: 120)
+            }
+            VStack(spacing: 10) {
+                Button("Done") { dismiss() }.buttonStyle(.borderedProminent).controlSize(.large).tint(.indigo).frame(maxWidth: .infinity)
+                Button("Import Another") { self.result = nil; self.errorMessage = nil }.buttonStyle(.bordered).frame(maxWidth: .infinity)
+            }
+        }
     }
 
     private func successView(_ r: ImportResult) -> some View {
@@ -133,6 +150,11 @@ struct ImportView: View {
                     LabeledContent("Notes", value: "\(r.notesImported)")
                     LabeledContent("Cards", value: "\(r.cardsImported)")
                     LabeledContent("Media", value: "\(r.mediaFiles) files")
+                    if r.notesSkipped > 0 || r.cardsSkipped > 0 {
+                        Divider()
+                        LabeledContent("Already present", value: "\(r.notesSkipped) notes, \(r.cardsSkipped) cards")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                 }
             }
             if !r.deckNames.isEmpty {
@@ -163,36 +185,41 @@ struct ImportView: View {
             VStack(spacing: 10) {
                 Button("Try Again") {
                     errorMessage = nil
-                    if let url = pendingURL { Task { await doImport(url: url) } }
+                    if let url = pendingURL { startImport(url: url) }
                 }.buttonStyle(.borderedProminent).tint(.indigo)
                 Button("Choose Different File") { showPicker = true }.buttonStyle(.bordered)
             }
         }
     }
 
-    private func doImport(url: URL) async {
-        await MainActor.run { isImporting = true; progressMessage = url.lastPathComponent; errorMessage = nil; result = nil }
-        do {
-            await MainActor.run { progressMessage = "Unzipping \(url.lastPathComponent)…" }
-            try await Task.sleep(nanoseconds: 200_000_000)
-            await MainActor.run { progressMessage = "Parsing collection…" }
-            let importer = ApkgImporter(modelContext: modelContext)
-            let res = try await importer.import(from: url)
-            await MainActor.run { isImporting = false; result = res; UINotificationFeedbackGenerator().notificationOccurred(.success) }
-        } catch {
-            await MainActor.run { isImporting = false; errorMessage = error.localizedDescription; UINotificationFeedbackGenerator().notificationOccurred(.error) }
+    /// Runs at most one import at a time and keeps a handle so it can be cancelled.
+    private func startImport(url: URL) {
+        guard importTask == nil else { return }
+        pendingURL = url
+        isImporting = true
+        progressMessage = url.lastPathComponent
+        errorMessage = nil
+        result = nil
+
+        importTask = Task { @MainActor in
+            defer { importTask = nil; isImporting = false }
+            do {
+                let importer = ApkgImporter(modelContext: modelContext)
+                let res = try await importer.import(from: url) { message in
+                    progressMessage = message
+                }
+                guard !Task.isCancelled else { return }
+                result = res
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            } catch is CancellationError {
+                errorMessage = ImportError.cancelled.localizedDescription
+            } catch {
+                errorMessage = error.localizedDescription
+                UINotificationFeedbackGenerator().notificationOccurred(.error)
+            }
         }
     }
 
-    /// Decks bundled with the app, so the sample list works on device too.
-    private func sampleApkgs() -> [URL] {
-        guard let directory = Bundle.main.url(forResource: "samples", withExtension: nil),
-              let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
-        else { return [] }
-        return files
-            .filter { ["apkg", "colpkg"].contains($0.pathExtension.lowercased()) }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
-    }
 }
 
 struct DocumentPicker: UIViewControllerRepresentable {
