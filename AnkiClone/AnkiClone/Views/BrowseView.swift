@@ -151,8 +151,7 @@ struct BrowseView: View {
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
     private func delete(_ card: Card) {
-        modelContext.delete(card)
-        try? modelContext.save()
+        CollectionMaintenance.delete(card: card, in: modelContext)
         UINotificationFeedbackGenerator().notificationOccurred(.warning)
     }
 }

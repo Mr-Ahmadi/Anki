@@ -153,6 +153,11 @@ struct ImportView: View {
                     LabeledContent("Notes", value: "\(r.notesImported)")
                     LabeledContent("Cards", value: "\(r.cardsImported)")
                     LabeledContent("Media", value: "\(r.mediaFiles) files")
+                    if r.cardsRelinked > 0 {
+                        Divider()
+                        LabeledContent("Restored", value: "\(r.cardsRelinked) cards")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
                     if r.notesSkipped > 0 || r.cardsSkipped > 0 {
                         Divider()
                         LabeledContent("Already present", value: "\(r.notesSkipped) notes, \(r.cardsSkipped) cards")

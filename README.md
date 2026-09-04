@@ -96,7 +96,7 @@ xcodebuild test -project AnkiClone.xcodeproj -scheme AnkiClone \
 
 ## Tests
 
-52 unit tests and 2 UI tests, all passing.
+55 unit tests and 2 UI tests, all passing.
 
 The unit tests cover template rendering, the HTML scanner, the content analyzer, language
 detection, the scheduler and due-date conversion, working from note fields copied verbatim out of
@@ -107,7 +107,10 @@ the SwiftData write are exercised without shipping a deck inside the app: decks,
 land and are linked both ways, a collection nested inside a folder is still found, archive entries
 resolve to the same destination whether or not the file exists yet (standardising a `/private` path
 against one that is not there yet silently extracts nothing, and only on device), re-importing the
-same package adds nothing and says so, progress is reported, and the two packages that cannot be read — a zstd collection and an archive with no collection at
+same package adds nothing and says so, deleting a deck and re-importing the same file brings the
+deck back with its cards (SwiftData's cascade rule leaves them behind, so they are deleted by hand,
+and an import adopts any card that has already lost its deck), progress is reported, and the two
+packages that cannot be read — a zstd collection and an archive with no collection at
 all — surface as errors rather than a stalled spinner.
 
 A dedicated suite covers what must never reach the synthesiser: tags, tags that only appear after

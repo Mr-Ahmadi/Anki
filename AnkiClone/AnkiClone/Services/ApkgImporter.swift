@@ -41,15 +41,19 @@ struct ImportResult {
     /// and cards are matched on their Anki id, so re-importing is a no-op.
     var notesSkipped: Int = 0
     var cardsSkipped: Int = 0
+    /// Cards that were already in the collection but had lost their deck or
+    /// note, and were put back where they belong by this import.
+    var cardsRelinked: Int = 0
 
     var notesInPackage: Int { notesImported + notesSkipped }
     var cardsInPackage: Int { cardsImported + cardsSkipped }
 
     /// The package read fine but added nothing, because all of it was already
     /// imported. That is not the same as a successful import and must not be
-    /// reported as one.
+    /// reported as one — nor is a repair, which does change the collection.
     var isAlreadyImported: Bool {
-        notesImported == 0 && cardsImported == 0 && (notesSkipped > 0 || cardsSkipped > 0)
+        notesImported == 0 && cardsImported == 0 && cardsRelinked == 0
+            && (notesSkipped > 0 || cardsSkipped > 0)
     }
 }
 
@@ -471,7 +475,8 @@ final class ApkgImporter {
         let existingDecks = try modelContext.fetch(FetchDescriptor<Deck>())
         let existingNotes = try modelContext.fetch(FetchDescriptor<Note>())
         let existingModels = try modelContext.fetch(FetchDescriptor<NoteType>())
-        let existingCardIds = Set(try modelContext.fetch(FetchDescriptor<Card>()).map(\.ankiId))
+        var existingCards: [Int64: Card] = [:]
+        for card in try modelContext.fetch(FetchDescriptor<Card>()) { existingCards[card.ankiId] = card }
         let existingDeckIds = Set(existingDecks.map(\.ankiId))
         let existingNoteIds = Set(existingNotes.map(\.ankiId))
         let existingModelIds = Set(existingModels.map(\.ankiId))
@@ -527,8 +532,23 @@ final class ApkgImporter {
         let crtDate = Date(timeIntervalSince1970: TimeInterval(parsed.collectionCreation))
         let now = Date()
         let fallbackDeck = deckMap[1] ?? deckMap.values.first
-        let newCards = parsed.cards.filter { !existingCardIds.contains($0.id) }
         var cardsByDeck: [Int64: [Card]] = [:]
+
+        // A card already in the collection can have lost the deck it belonged
+        // to — deleting a deck leaves its cards behind — and re-importing would
+        // then skip it by id and rebuild the deck empty. Reattach it instead.
+        var cardsRelinked = 0
+        for c in parsed.cards {
+            guard let existing = existingCards[c.id] else { continue }
+            let target = deckMap[c.did] ?? fallbackDeck
+            if existing.note == nil { existing.note = noteMap[c.nid] }
+            guard existing.deck == nil || existing.deck?.ankiId != target?.ankiId else { continue }
+            cardsByDeck[target?.ankiId ?? 1, default: []].append(existing)
+            cardsRelinked += 1
+        }
+        if cardsRelinked > 0 { report("Restoring \(cardsRelinked) cards…") }
+
+        let newCards = parsed.cards.filter { existingCards[$0.id] == nil }
         for c in newCards {
             try Task.checkCancellation()
             let dueDate = Self.computeDueDate(due: c.due, ivl: c.ivl, type: c.type, queue: c.queue, crt: crtDate, now: now)
@@ -578,7 +598,8 @@ final class ApkgImporter {
             mediaFiles: mediaFiles,
             deckNames: parsed.decks.map(\.name),
             notesSkipped: parsed.notes.count - notesImported,
-            cardsSkipped: parsed.cards.count - cardsImported
+            cardsSkipped: parsed.cards.count - cardsImported,
+            cardsRelinked: cardsRelinked
         )
     }
 

@@ -596,6 +596,83 @@ final class ApkgImportTests: XCTestCase {
         XCTAssertEqual(first.notesSkipped, 0)
     }
 
+    /// Deleting a deck and re-importing the very same package used to bring
+    /// the deck back empty: SwiftData left the cards in the store, so the
+    /// importer matched their ids and skipped every one of them.
+    @MainActor
+    func testReimportingAfterDeletingTheDeckRestoresItsCards() async throws {
+        let collection = workDir.appendingPathComponent("collection.anki2")
+        try makeCollection(noteCount: 10, at: collection)
+        let package = try makePackage(named: "deck.apkg", files: ["collection.anki2": collection])
+
+        let context = try freshContext()
+        _ = try await ApkgImporter(modelContext: context).import(from: package)
+
+        for deck in try context.fetch(FetchDescriptor<Deck>()) {
+            CollectionMaintenance.delete(deck, in: context)
+        }
+        XCTAssertEqual(try context.fetch(FetchDescriptor<Card>()).count, 0, "deleting a deck must take its cards with it")
+        XCTAssertEqual(try context.fetch(FetchDescriptor<Note>()).count, 0, "notes left with no cards must go too")
+
+        let second = try await ApkgImporter(modelContext: context).import(from: package)
+        XCTAssertEqual(second.notesImported, 10)
+        XCTAssertEqual(second.cardsImported, 10)
+        XCTAssertFalse(second.isAlreadyImported)
+
+        let decks = try context.fetch(FetchDescriptor<Deck>())
+        XCTAssertEqual(decks.reduce(0) { $0 + $1.cards.count }, 10)
+        let unit = try XCTUnwrap(decks.first { $0.name == "Vocab::Unit 1" })
+        XCTAssertEqual(unit.cards.count, 5)
+    }
+
+    /// The repair path, for collections already left in the broken state by a
+    /// delete that ran before the fix: the cards are still there but belong to
+    /// no deck, and re-importing has to adopt them rather than skip them.
+    @MainActor
+    func testReimportAdoptsCardsThatLostTheirDeck() async throws {
+        let collection = workDir.appendingPathComponent("collection.anki2")
+        try makeCollection(noteCount: 10, at: collection)
+        let package = try makePackage(named: "deck.apkg", files: ["collection.anki2": collection])
+
+        let context = try freshContext()
+        _ = try await ApkgImporter(modelContext: context).import(from: package)
+
+        // Exactly what the old `modelContext.delete(deck)` left behind.
+        for deck in try context.fetch(FetchDescriptor<Deck>()) {
+            for card in deck.cards { card.deck = nil }
+            context.delete(deck)
+        }
+        try context.save()
+        XCTAssertEqual(try context.fetch(FetchDescriptor<Card>()).count, 10)
+
+        let second = try await ApkgImporter(modelContext: context).import(from: package)
+        XCTAssertEqual(second.cardsImported, 0, "the cards were already there")
+        XCTAssertEqual(second.cardsRelinked, 10)
+        XCTAssertFalse(second.isAlreadyImported, "a repair changed the collection; it is not a no-op")
+
+        let decks = try context.fetch(FetchDescriptor<Deck>())
+        XCTAssertEqual(decks.reduce(0) { $0 + $1.cards.count }, 10)
+        XCTAssertTrue(try context.fetch(FetchDescriptor<Card>()).allSatisfy { $0.deck != nil })
+    }
+
+    /// Deleting one card must not strand its note — a note with no cards is
+    /// invisible, yet would still be matched by id on the next import.
+    @MainActor
+    func testDeletingACardRemovesItsNowEmptyNote() async throws {
+        let collection = workDir.appendingPathComponent("collection.anki2")
+        try makeCollection(noteCount: 3, at: collection)
+        let package = try makePackage(named: "deck.apkg", files: ["collection.anki2": collection])
+
+        let context = try freshContext()
+        _ = try await ApkgImporter(modelContext: context).import(from: package)
+
+        let card = try XCTUnwrap(try context.fetch(FetchDescriptor<Card>()).first)
+        CollectionMaintenance.delete(card: card, in: context)
+
+        XCTAssertEqual(try context.fetch(FetchDescriptor<Card>()).count, 2)
+        XCTAssertEqual(try context.fetch(FetchDescriptor<Note>()).count, 2)
+    }
+
     /// A zstd collection is what Anki 2.1.50+ writes without legacy support.
     /// SQLite opens it lazily and then fails every query, which used to leave
     /// the import sitting on "Importing…"; it has to surface as an error.

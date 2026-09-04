@@ -285,8 +285,7 @@ struct DeckListView: View {
         UIImpactFeedbackGenerator(style: .medium).impactOccurred()
     }
     private func deleteDeck(_ deck: Deck) {
-        modelContext.delete(deck)
-        try? modelContext.save()
+        CollectionMaintenance.delete(deck, in: modelContext)
         UINotificationFeedbackGenerator().notificationOccurred(.warning)
     }
 }
